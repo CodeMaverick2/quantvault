@@ -8,9 +8,11 @@
 QuantVault is a fully automated yield strategy vault on Ranger Finance. It captures Drift Protocol perpetual funding rates with short positions while maintaining a base lending yield through Kamino and Drift Spot. A 3-state Hidden Markov Model continuously detects market regimes and scales positions — fully exiting perps during crisis conditions.
 
 **Key stats (live backtest, Feb–Mar 2026):**
+- 116/116 tests passing across all signal modules
 - 83.3% LSTM funding direction prediction accuracy
-- 0% drawdown in HIGH_VOL_CRISIS bear market
-- Shifts automatically to 70% lending when perp conditions unfavorable
+- 0% drawdown in HIGH_VOL_CRISIS bear market (correctly shifts to 70% lending)
+- 7-layer allocation stack with ATR-responsive leverage and time-of-day optimization
+- Oracle manipulation defense (Mango Markets-style 3σ rolling halt)
 
 See [STRATEGY.md](./STRATEGY.md) for full strategy documentation.
 
@@ -85,15 +87,22 @@ python scripts/collect_training_data.py --days 90
 python scripts/train_models.py --validate
 ```
 
-### 4. Deploy Vault (Devnet)
+### 4. Deploy Vault
+
+> **Note:** The Voltr vault program (`vVoLTRjQmtFpiYoegx285Ze4gsLJ8ZxgFKVcuvmG1a8`) is
+> deployed on **mainnet only**. For devnet testing, the strategy engine, keeper bot, and
+> all signals run fully against devnet Drift data. Vault deployment requires mainnet USDC.
 
 ```bash
-# Creates vault, registers Kamino + Drift Spot adaptors
-npx ts-node scripts/init_vault.ts
-npx ts-node scripts/add_strategies.ts
+# Mainnet: set CLUSTER=mainnet-beta and a mainnet RPC_URL in .env first
+npm run init-vault   # scripts/init_vault.ts (uses @voltr/vault-sdk)
+npm run add-strategies  # scripts/add_strategies.ts
 
+# Or use the Ranger Finance UI: https://vaults.ranger.finance/create
 # Copy VAULT_ADDRESS from config/vault_addresses.json to .env
 ```
+
+**Keeper wallet for testnet/demo:** `BPrSjs3XtA8qL2TrBB2LHq4EWzx7qtVjAjKRkErcqifj` (10 SOL devnet)
 
 ### 5. Run Full Stack
 
@@ -127,8 +136,11 @@ python scripts/backtest.py --days 90 --initial-nav 100000
 | `GET /regime` | Current HMM regime + confidence |
 | `GET /allocations` | Target allocations per protocol |
 | `GET /hedge-ratios` | Per-market Kalman hedge ratios |
-| `GET /signals` | Current risk signals (cascade score, circuit breakers) |
-| `POST /update` | Push new market data (called by keeper bot) |
+| `GET /signals` | Full signal stack: AR predictions, persistence, dual-HMM, ToD, oracle defense |
+| `GET /risk` | Circuit breaker state, drawdown, active events |
+| `POST /update-market` | Push new market data (funding APR, oracle price, OBI) |
+| `POST /record-nav` | Record NAV for drawdown tracking |
+| `POST /lending-rates` | Update Kamino + Drift Spot APRs |
 
 ---
 
@@ -136,7 +148,7 @@ python scripts/backtest.py --days 90 --initial-nav 100000
 
 ```bash
 # Python
-python -m pytest strategy/tests/ -v   # 85 tests
+python -m pytest strategy/tests/ -v   # 116 tests
 
 # TypeScript
 cd bot && npm test

@@ -40,6 +40,7 @@ from .signals.drift_data import DriftDataClient
 from .signals.funding_features import build_features, get_hmm_feature_matrix
 from .signals.funding_persistence import FundingPersistenceScorer
 from .signals.ar_funding_predictor import ARFundingPredictor
+from .signals.tod_optimizer import TimeOfDayOptimizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -173,6 +174,9 @@ _persistence_scorer = FundingPersistenceScorer()
 
 # AR(4) funding predictor — only enter when AR prediction exceeds breakeven
 _ar_predictor = ARFundingPredictor(breakeven_apr=22.0)
+
+# Time-of-day optimizer — concentrates positions in historically rich UTC windows
+_tod_optimizer = TimeOfDayOptimizer()
 
 # Threading/async safety locks
 _market_state_lock = asyncio.Lock()
@@ -329,6 +333,10 @@ async def get_signals():
             _latest_fast_regime.regime == _latest_regime.regime
             if _latest_fast_regime and _latest_regime else False
         ),
+        "tod": {
+            "multiplier": _tod_optimizer.current_multiplier(),
+            **vars(_tod_optimizer.get_multiplier()),
+        },
         "circuit_breaker": circuit_breaker.state.value,
         "cb_scale": circuit_breaker.get_position_multiplier(),
         "market_states": {
@@ -400,6 +408,9 @@ async def get_allocations():
     fast_r = _latest_fast_regime.regime if _latest_fast_regime else None
     fast_c = _latest_fast_regime.confidence if _latest_fast_regime else 1.0
 
+    # Time-of-day multiplier: concentrate perp sizing in high-yield UTC windows
+    tod_mult = _tod_optimizer.current_multiplier()
+
     result = optimizer.compute(
         markets=markets,
         regime=regime,
@@ -410,6 +421,7 @@ async def get_allocations():
         drift_spot_apr=_drift_spot_apr,
         fast_regime=fast_r,
         fast_confidence=fast_c,
+        tod_multiplier=tod_mult,
     )
 
     return {
@@ -421,6 +433,7 @@ async def get_allocations():
         "regime": result.regime,
         "position_scale": result.position_scale,
         "expected_blended_apr": result.expected_blended_apr,
+        "tod_multiplier": tod_mult,
     }
 
 
@@ -594,8 +607,9 @@ async def _fetch_and_update_market_data():
             for _, row in df.iterrows():
                 _ar_predictor.update(sym, float(row.get("apr", 0.0)))
 
-            # Update persistence scorer
+            # Update persistence scorer and time-of-day optimizer
             _persistence_scorer.update(sym, apr, basis_pct=basis, z_score=z_score)
+            _tod_optimizer.update(apr)
 
             async with _market_state_lock:
                 _market_state[sym]["funding_apr"] = apr

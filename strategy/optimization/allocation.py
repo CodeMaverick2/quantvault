@@ -9,8 +9,10 @@ Key improvements over naive delta-neutral:
   1. Dual-timeframe regime agreement gate (fast + slow HMM must agree)
   2. Kelly × (1 - cascade_score) multiplicative sizing
   3. Funding persistence filter (min 3 consecutive positive hours)
-  4. Volatility-adjusted position scaling
+  4. Volatility-adjusted position scaling (vol-targeting)
   5. Basis-momentum confirmation for entry quality
+  6. ATR-responsive leverage scaling (inversely proportional to realized vol)
+  7. Time-of-day multiplier (concentrate positions during high-yield UTC windows)
 """
 
 import logging
@@ -32,10 +34,11 @@ class MarketYieldData:
     funding_apr: float             # current annualized funding rate (%)
     lending_apr: float             # lending protocol APY (%)
     is_perp: bool
-    cascade_risk: float = 0.0     # 0–1 cascade risk score
+    cascade_risk: float = 0.0      # 0–1 cascade risk score
     persistence_score: float = 1.0  # 0–1 funding persistence quality
     realized_vol_24h: float = 0.20  # 24h realized vol (annualized, fraction)
-    consecutive_positive: int = 0  # consecutive hours of positive funding
+    consecutive_positive: int = 0   # consecutive hours of positive funding
+    atr_14h: float = 0.02          # 14-period ATR as fraction of price (default 2%)
 
 
 @dataclass
@@ -87,23 +90,27 @@ class AllocationConfig:
 
 class DynamicAllocationOptimizer:
     """
-    Computes target portfolio allocations using a 5-layer signal stack:
+    Computes target portfolio allocations using a 7-layer signal stack:
 
-    Layer 1: Regime gate (HMM) — sets max perp budget
+    Layer 1: Regime gate (HMM) — sets max perp budget via position_scale
     Layer 2: Funding quality gate — requires persistence + APR threshold
     Layer 3: Kelly sizing — positions sized by risk-adjusted expected return
     Layer 4: Cascade risk multiplier — Kelly × (1 - cascade_score)
     Layer 5: Vol targeting — scale down when realized vol exceeds target
+    Layer 6: ATR-responsive leverage — halve leverage when ATR doubles vs baseline
+    Layer 7: Time-of-day multiplier — concentrate during high-yield UTC windows
 
     The result is a deterministic, idempotent allocation that degrades
     gracefully as market conditions deteriorate.
 
     Example sizing for SOL-PERP with:
-      - funding APR = 20%, vol = 20% annualized, cascade = 0.2, persistence = 0.8
+      - funding APR = 20%, vol = 20% annualized, cascade = 0.2, atr = 3%, ToD = 1.1
       - kelly_fraction(0.25x) = 0.38
       - cascade_adj = 0.38 × (1 - 0.2) = 0.30
       - vol_adj = min(1.0, 0.15/0.20) = 0.75 → 0.30 × 0.75 = 0.23
-      - Capped at max_single_perp_pct = 0.25 → final = 0.23 (22.5% of NAV)
+      - atr_adj = clip(0.02/0.03, 0.5, 1.5) = 0.67 → 0.23 × 0.67 = 0.15
+      - ToD × perp_budget = 0.60 × 1.1 = 0.66 budget cap
+      - Final = 0.15 (15% of NAV, inside budget)
     """
 
     def __init__(self, config: AllocationConfig | None = None):
@@ -121,6 +128,8 @@ class DynamicAllocationOptimizer:
         # Dual-timeframe HMM agreement (optional — defaults to single HMM)
         fast_regime: MarketRegime | None = None,
         fast_confidence: float = 1.0,
+        # Time-of-day multiplier from TimeOfDayOptimizer [0.5, 1.5]
+        tod_multiplier: float = 1.0,
     ) -> AllocationResult:
         """
         Main allocation computation.
@@ -170,8 +179,11 @@ class DynamicAllocationOptimizer:
             and m.consecutive_positive >= self.config.min_consecutive_positive
         ]
 
-        # ── Layer 3+4+5: Kelly × cascade × vol allocation ────────────────────
-        perp_budget = self.config.max_perp_pct * effective_scale
+        # ── Layer 3+4+5+6+7: Kelly × cascade × vol × ATR × ToD ──────────────
+        # ToD multiplier concentrates size during historically rich UTC windows
+        # Clipped separately so regime_scale and external_scale remain unaffected
+        tod_scale = float(np.clip(tod_multiplier, 0.5, 1.5))
+        perp_budget = self.config.max_perp_pct * effective_scale * tod_scale
         perp_allocs: dict[str, float] = {}
         sizing_breakdown: dict[str, dict] = {}
 
@@ -283,18 +295,27 @@ class DynamicAllocationOptimizer:
             else:
                 vol_scale = 1.0
 
-            final_size = cascade_adj * vol_scale
+            # Layer 6: ATR-responsive leverage — reduce leverage in high-ATR regimes
+            # Scale inversely: if ATR doubles, leverage halves (capped 0.5x – 1.5x)
+            # BASE_ATR = 2% represents a "normal" market; higher ATR → smaller position
+            BASE_ATR = 0.02
+            atr = max(m.atr_14h, 0.005)  # floor at 0.5% to avoid div by zero
+            atr_leverage_scale = float(np.clip(BASE_ATR / atr, 0.5, 1.5))
+
+            final_size = cascade_adj * vol_scale * atr_leverage_scale
 
             kelly_cascade_sizes[m.symbol] = max(final_size, 0.0)
             breakdown[m.symbol] = {
                 "kelly_raw": round(kelly_raw, 4),
                 "cascade_adj": round(cascade_adj, 4),
                 "vol_scale": round(vol_scale, 4),
+                "atr_leverage_scale": round(atr_leverage_scale, 4),
                 "final_pre_budget": round(final_size, 4),
                 "funding_apr": m.funding_apr,
                 "cascade_risk": m.cascade_risk,
                 "persistence_score": m.persistence_score,
                 "realized_vol_24h": m.realized_vol_24h,
+                "atr_14h": m.atr_14h,
             }
 
         total_kelly = sum(kelly_cascade_sizes.values())

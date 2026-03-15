@@ -12,6 +12,7 @@ Endpoints consumed by the TypeScript keeper bot:
 """
 
 import asyncio
+import collections
 import logging
 import os
 import time
@@ -51,6 +52,39 @@ MODEL_DIR = Path(__file__).parent.parent / "models"
 
 with open(CONFIG_PATH) as f:
     CFG = yaml.safe_load(f)
+
+
+def _validate_config(cfg: dict) -> None:
+    """Validate required config keys are present and have sane values."""
+    required_keys = [
+        ("hmm", "n_states"),
+        ("hmm", "n_iter"),
+        ("hmm", "covariance_type"),
+        ("kalman", "process_noise"),
+        ("kalman", "observation_noise"),
+        ("risk", "cascade_risk_threshold"),
+        ("risk", "max_negative_funding_apr"),
+        ("risk", "max_basis_pct"),
+        ("risk", "max_oracle_deviation_pct"),
+        ("risk", "daily_drawdown_halt"),
+        ("risk", "weekly_drawdown_halt"),
+        ("risk", "monthly_drawdown_review"),
+        ("risk", "circuit_breaker_cooldown_minutes"),
+        ("allocation", "min_lending_pct"),
+        ("allocation", "max_perp_pct"),
+        ("strategy", "target_funding_apr_threshold"),
+        ("markets", "perp"),
+    ]
+    for section, key in required_keys:
+        if section not in cfg or key not in cfg[section]:
+            raise KeyError(f"Missing required config: [{section}][{key}]")
+    if not cfg["markets"]["perp"]:
+        raise ValueError("markets.perp must contain at least one market")
+    if cfg["hmm"]["n_states"] < 3:
+        raise ValueError(f"hmm.n_states must be >= 3, got {cfg['hmm']['n_states']}")
+
+
+_validate_config(CFG)
 
 SYMBOLS = [m["symbol"] for m in CFG["markets"]["perp"]]
 
@@ -115,8 +149,17 @@ _market_state: dict[str, dict] = {
 _latest_regime: Optional[RegimePrediction] = None
 _kamino_apr: float = 5.0
 _drift_spot_apr: float = 7.0
-_hmm_feature_buffer: list[np.ndarray] = []  # rolling window for HMM predictions
 HMM_BUFFER_SIZE = 48  # 48 hours of hourly data
+_hmm_feature_buffer: collections.deque = collections.deque(maxlen=HMM_BUFFER_SIZE)
+
+# Threading/async safety locks
+_market_state_lock = asyncio.Lock()
+_regime_lock = asyncio.Lock()
+_hmm_lock = asyncio.Lock()
+
+# Periodic HMM retraining tracker (retrain weekly)
+_hmm_last_retrain_ts: float = 0.0
+HMM_RETRAIN_INTERVAL_SECS = 7 * 86400  # 1 week
 
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
@@ -393,6 +436,8 @@ async def _market_data_loop():
 
 
 async def _fetch_and_update_market_data():
+    global _hmm_last_retrain_ts
+
     async with DriftDataClient() as client:
         dfs = await client.get_multi_market_funding(SYMBOLS, limit=HMM_BUFFER_SIZE + 50)
 
@@ -400,28 +445,35 @@ async def _fetch_and_update_market_data():
         if df.empty:
             continue
 
-        from .signals.funding_features import build_features, get_hmm_feature_matrix
         enriched = build_features(df)
         X, idx = get_hmm_feature_matrix(enriched)
 
         if len(X) >= 10:
-            # Update HMM feature buffer with latest row
-            _hmm_feature_buffer.append(X[-1])
-            if len(_hmm_feature_buffer) > HMM_BUFFER_SIZE * len(SYMBOLS):
-                _hmm_feature_buffer.pop(0)
+            # Update HMM feature buffer with latest row (deque enforces maxlen automatically)
+            async with _hmm_lock:
+                _hmm_feature_buffer.append(X[-1])
 
-            # Train HMM if we have enough data and it's not yet fitted
-            if not hmm.is_fitted and len(X) >= 50:
-                logger.info("Training HMM on %d observations for %s", len(X), sym)
-                hmm.fit(X)
-                hmm.save()
+                now = time.time()
+                # Train HMM if not yet fitted, or retrain weekly
+                should_retrain = (
+                    not hmm.is_fitted
+                    or (now - _hmm_last_retrain_ts) >= HMM_RETRAIN_INTERVAL_SECS
+                )
+                if should_retrain and len(X) >= 50:
+                    logger.info(
+                        "Training HMM on %d observations for %s (retrain=%s)",
+                        len(X), sym, hmm.is_fitted,
+                    )
+                    hmm.fit(X)
+                    hmm.save()
+                    _hmm_last_retrain_ts = now
 
         # Update market state with latest funding rate
-        if not df.empty:
+        if sym in _market_state:
             latest = df.iloc[-1]
             apr = float(latest.get("apr", 0.0))
             basis = float(latest.get("basis_pct", 0.0))
-            if sym in _market_state:
+            async with _market_state_lock:
                 _market_state[sym]["funding_apr"] = apr
                 _market_state[sym]["basis_pct"] = basis
                 _market_state[sym]["updated_at"] = time.time()

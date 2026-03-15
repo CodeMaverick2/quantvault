@@ -32,6 +32,7 @@ class CircuitBreakerEvent:
     threshold: float
     action_taken: str
     resolved_at: Optional[float] = None
+    trigger_count: int = 0
 
     @property
     def is_active(self) -> bool:
@@ -188,7 +189,7 @@ class CircuitBreaker:
         return 1.0  # NORMAL or WARNING
 
     def _log_event(self, name: str, value: float, threshold: float) -> None:
-        # Only log new events (avoid duplicates in rapid-fire checks)
+        # If an active event already exists, increment its count instead of creating a duplicate
         existing = next(
             (e for e in self._events if e.trigger_name == name and e.is_active), None
         )
@@ -200,8 +201,11 @@ class CircuitBreaker:
                     value=value,
                     threshold=threshold,
                     action_taken="EMERGENCY_EXIT",
+                    trigger_count=1,
                 )
             )
+        else:
+            existing.trigger_count += 1
 
     def recent_events(self, n: int = 10) -> list[CircuitBreakerEvent]:
         return sorted(self._events, key=lambda e: e.triggered_at, reverse=True)[:n]

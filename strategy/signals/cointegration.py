@@ -188,11 +188,10 @@ class CointegrationEngine:
             and historical_a is not None
             and len(historical_a) >= self.min_history
         ):
-            is_coint, p_val, static_beta = (
-                self.test_cointegration(historical_a, historical_b)
-                if historical_a is not None
-                else (True, 0.0, 1.0)
-            )
+            if historical_a is None or historical_b is None:
+                is_coint, p_val, static_beta = True, 0.0, 1.0
+            else:
+                is_coint, p_val, static_beta = self.test_cointegration(historical_a, historical_b)
             initial_beta = static_beta if is_coint else 1.0
             tracker = KalmanPairTracker(
                 process_noise=self.process_noise,
@@ -200,7 +199,7 @@ class CointegrationEngine:
                 initial_beta=initial_beta,
             )
             # Warm up tracker on historical data
-            if historical_a is not None:
+            if historical_a is not None and historical_b is not None:
                 for xa, xb in zip(historical_a[-self.min_history :], historical_b[-self.min_history :]):
                     tracker.update(xb, xa)
             self._trackers[key] = tracker
@@ -214,6 +213,15 @@ class CointegrationEngine:
                 cointegrated=is_coint,
                 p_value=p_val if historical_a is not None else 0.05,
                 last_fit_ts=current_ts,
+            )
+
+        if not np.isfinite(log_price_a) or not np.isfinite(log_price_b):
+            return StatArbSignal(
+                pair=f"{symbol_a}-{symbol_b}",
+                z_score=0.0,
+                action="HOLD",
+                beta=self._trackers[key].hedge_ratio if key in self._trackers else 1.0,
+                confidence=0.0,
             )
 
         tracker = self._trackers[key]

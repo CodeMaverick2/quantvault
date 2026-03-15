@@ -111,6 +111,32 @@ class TestCircuitBreaker:
         )
         assert len(cb.active_events) >= 1
 
+    def test_repeated_trigger_increments_count_not_duplicates(self, cb):
+        """Firing the same condition twice must increment trigger_count, not create a new event."""
+        for _ in range(3):
+            cb.check(
+                funding_apr=-0.50,
+                basis_pct=0.005,
+                oracle_deviation_pct=0.001,
+                cascade_risk_score=0.30,
+                book_depth_ratio=1.0,
+            )
+        neg_fund_events = [e for e in cb.active_events if e.trigger_name == "NEGATIVE_FUNDING"]
+        assert len(neg_fund_events) == 1
+        assert neg_fund_events[0].trigger_count == 3
+
+    def test_trigger_count_field_exists(self, cb):
+        cb.check(
+            funding_apr=-0.50,
+            basis_pct=0.005,
+            oracle_deviation_pct=0.001,
+            cascade_risk_score=0.30,
+            book_depth_ratio=1.0,
+        )
+        event = cb.active_events[0]
+        assert hasattr(event, "trigger_count")
+        assert event.trigger_count >= 1
+
 
 class TestDrawdownController:
     def test_hwm_increases_monotonically(self):
@@ -155,6 +181,37 @@ class TestDrawdownController:
         assert ctrl.is_halted
         ctrl.resume()
         assert not ctrl.is_halted
+
+    def test_record_nav_rejects_zero(self):
+        """record_nav must raise ValueError for nav=0."""
+        ctrl = DrawdownController()
+        with pytest.raises(ValueError, match="NAV must be positive"):
+            ctrl.record_nav(0.0)
+
+    def test_record_nav_rejects_negative(self):
+        """record_nav must raise ValueError for negative nav."""
+        ctrl = DrawdownController()
+        with pytest.raises(ValueError, match="NAV must be positive"):
+            ctrl.record_nav(-100.0)
+
+    def test_hysteresis_prevents_immediate_resume(self):
+        """After a weekly halt, strategy should not resume until drawdown recovers past hysteresis."""
+        ctrl = DrawdownController(weekly_halt_pct=-0.07, hysteresis=0.02)
+        ts_base = time.time()
+        ctrl.record_nav(100.0, ts_base)
+        # Trigger a weekly halt: 8% drop
+        state = ctrl.record_nav(92.0, ts_base + 3600 * 24)
+        assert state.is_halted
+
+        # Recover to exactly at halt threshold (-7%) — should remain halted due to hysteresis
+        # weekly_dd = (93 - 100) / 100 = -0.07, which is NOT > weekly_halt + hysteresis (-0.05)
+        state2 = ctrl.record_nav(93.0, ts_base + 3600 * 24 * 2)
+        assert state2.is_halted, "Should still be halted within hysteresis band"
+
+        # Recover further past hysteresis band: weekly_dd > -0.07 + 0.02 = -0.05
+        # nav=96 → weekly_dd ≈ (96 - 100)/100 = -0.04, which IS > -0.05
+        state3 = ctrl.record_nav(96.0, ts_base + 3600 * 24 * 3)
+        assert not state3.is_halted, "Should resume once past hysteresis band"
 
 
 class TestPositionValidator:

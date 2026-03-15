@@ -157,7 +157,7 @@ export class DriftManager {
     const limitPriceBn = new BN(Math.floor(limitPrice * PRICE_PRECISION.toNumber()));
 
     logger.info(
-      `Opening short ${symbol} perp: $${sizeUsd.toFixed(2)} notional @ oracle ${oraclePrice.toFixed(4)}`
+      `Opening short perp market=${marketIndex}: $${sizeUsd.toFixed(2)} notional @ oracle ${oraclePrice.toFixed(4)}`
     );
 
     const orderParams = getLimitOrderParams({

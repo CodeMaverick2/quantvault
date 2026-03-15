@@ -17,6 +17,7 @@ import { AnchorProvider } from "@coral-xyz/anchor";
 import logger from "./logger";
 import { StrategyEngineClient } from "./strategyClient";
 import { DriftManager } from "./drift";
+import { VaultManager } from "./vault";
 import { Rebalancer } from "./rebalancer";
 import { RiskMonitor } from "./riskMonitor";
 import { startMetricsServer, vaultNavGauge } from "./metrics";
@@ -80,8 +81,14 @@ async function main() {
   // ── Service wiring ───────────────────────────────────────────────────────
   const strategyClient = new StrategyEngineClient(strategyUrl);
   const driftMgr = new DriftManager(driftClient, user);
+  const vaultMgr = new VaultManager(
+    connection,
+    keypair,
+    process.env.VAULT_ADDRESS ?? "",
+    process.env.VOLTR_API_URL ?? "https://api.voltr.xyz"
+  );
   const riskMonitor = new RiskMonitor(driftMgr, strategyClient);
-  const rebalancer = new Rebalancer(driftMgr, strategyClient);
+  const rebalancer = new Rebalancer(driftMgr, vaultMgr, strategyClient);
 
   // ── Metrics server ───────────────────────────────────────────────────────
   startMetricsServer(metricsPort);

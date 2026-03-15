@@ -67,12 +67,28 @@ class KalmanHedgeRatio:
         Update state with a new observation.
 
         Args:
-            price: The perp/spot price (x variable in the linear model)
+            price: The perp/spot price (x variable in the linear model); must be > 0
             spread_value: The observed spread value (y variable)
 
         Returns:
             HedgeState with updated beta, alpha, and diagnostic metrics
         """
+        if price <= 0:
+            raise ValueError(f"price must be positive, got {price}")
+
+        if not np.isfinite(price) or not np.isfinite(spread_value):
+            # Return last known state (or a neutral default) without corrupting filter state
+            if self._last_state is not None:
+                return self._last_state
+            return HedgeState(
+                beta=float(self._state[0]),
+                alpha=float(self._state[1]),
+                cov=self._P.copy(),
+                innovation=0.0,
+                innovation_var=self._R,
+                z_score=0.0,
+            )
+
         # Observation matrix H = [price, 1]
         H = np.array([price, 1.0], dtype=float)
 

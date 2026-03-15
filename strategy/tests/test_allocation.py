@@ -141,6 +141,43 @@ class TestDynamicAllocationOptimizer:
         )
         assert result.expected_blended_apr > 0.0
 
+    def test_blended_apr_accuracy(self, optimizer):
+        """Expected blended APR must exactly match the weighted sum of component APRs."""
+        kamino_apr = 5.0
+        drift_apr = 7.0
+        result = optimizer.compute(
+            markets=make_markets(sol_apr=20.0, btc_apr=15.0, eth_apr=12.0),
+            regime=MarketRegime.BULL_CARRY,
+            regime_confidence=0.9,
+            drawdown_scale=1.0,
+            cb_scale=1.0,
+            kamino_apr=kamino_apr,
+            drift_spot_apr=drift_apr,
+        )
+        # Manually recompute expected blended APR
+        perp_apr_map = {"SOL-PERP": 20.0, "BTC-PERP": 15.0, "ETH-PERP": 12.0}
+        expected = (
+            result.kamino_lending_pct * kamino_apr
+            + result.drift_spot_lending_pct * drift_apr
+            + sum(alloc * perp_apr_map.get(sym, 0.0) for sym, alloc in result.perp_allocations.items())
+        )
+        assert result.expected_blended_apr == pytest.approx(expected, rel=1e-6)
+
+    def test_min_lending_pct_enforced_even_with_large_perp_budget(self, optimizer):
+        """When perp allocations would exceed 1 - min_lending_pct, lending must still be >= min."""
+        result = optimizer.compute(
+            markets=make_markets(sol_apr=100.0, btc_apr=100.0, eth_apr=100.0),
+            regime=MarketRegime.BULL_CARRY,
+            regime_confidence=1.0,
+            drawdown_scale=1.0,
+            cb_scale=1.0,
+            kamino_apr=5.0,
+            drift_spot_apr=7.0,
+        )
+        assert result.total_lending_pct >= 0.10 - 0.005
+        total = result.total_perp_pct + result.total_lending_pct
+        assert total <= 1.0 + 0.005
+
     def test_bull_regime_has_more_perp_than_sideways(self, optimizer):
         bull = optimizer.compute(
             markets=make_markets(),

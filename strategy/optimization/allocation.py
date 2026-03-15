@@ -134,11 +134,7 @@ class DynamicAllocationOptimizer:
         result.perp_allocations = perp_allocs
         result.total_perp_pct = sum(perp_allocs.values())
 
-        # --- Phase 2: Lending fills the remainder ---
-        remaining = 1.0 - result.total_perp_pct
-
-        # Allocate remaining to lending, preferring higher APY
-        total_lending = max(remaining, self.config.min_lending_pct)
+        # --- Phase 2: Lending fills the remainder, with min_lending floor ---
         if drift_spot_apr >= kamino_apr:
             drift_share = 0.60
             kamino_share = 0.40
@@ -146,31 +142,42 @@ class DynamicAllocationOptimizer:
             drift_share = 0.40
             kamino_share = 0.60
 
+        # Compute perps first; lending gets whatever remains, then clamp to min_lending_pct
+        lending_from_remainder = 1.0 - result.total_perp_pct
+        total_lending = max(lending_from_remainder, self.config.min_lending_pct)
+
+        # If min_lending_pct forces total > 1.0, scale down perps proportionally
+        if result.total_perp_pct + total_lending > 1.0:
+            total_lending = self.config.min_lending_pct
+            perp_budget_capped = 1.0 - total_lending
+            if result.total_perp_pct > perp_budget_capped:
+                scale = perp_budget_capped / result.total_perp_pct if result.total_perp_pct > 0 else 0.0
+                perp_allocs = {sym: v * scale for sym, v in perp_allocs.items()}
+                result.perp_allocations = perp_allocs
+                result.total_perp_pct = sum(perp_allocs.values())
+
         result.drift_spot_lending_pct = total_lending * drift_share
         result.kamino_lending_pct = total_lending * kamino_share
         result.total_lending_pct = total_lending
 
-        # --- Phase 3: Normalize to 100% ---
+        # --- Phase 3: Normalize to 100% (final adjustment) ---
         total = result.total_perp_pct + result.total_lending_pct
         if abs(total - 1.0) > 0.005:
-            # Adjust lending to fill remaining
             adjustment = 1.0 - result.total_perp_pct
             result.drift_spot_lending_pct = adjustment * drift_share
             result.kamino_lending_pct = adjustment * kamino_share
             result.total_lending_pct = adjustment
 
-        result.total_pct = (
-            result.total_perp_pct + result.total_lending_pct
-        )
+        result.total_pct = result.total_perp_pct + result.total_lending_pct
 
         # --- Expected blended APR ---
+        # Build a lookup map to avoid repeated linear search with next()
+        funding_apr_map: dict[str, float] = {m.symbol: m.funding_apr for m in eligible_markets}
         blended = (
             result.kamino_lending_pct * kamino_apr
             + result.drift_spot_lending_pct * drift_spot_apr
             + sum(
-                alloc * next(
-                    (m.funding_apr for m in eligible_markets if m.symbol == sym), 0.0
-                )
+                alloc * funding_apr_map.get(sym, 0.0)
                 for sym, alloc in perp_allocs.items()
             )
         )

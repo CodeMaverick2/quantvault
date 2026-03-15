@@ -41,11 +41,13 @@ class DrawdownController:
         weekly_halt_pct: float = -0.07,
         monthly_review_pct: float = -0.15,
         soft_scale_threshold: float = -0.01,   # -1% → start scaling down at 50%
+        hysteresis: float = 0.01,              # gap between halt and resume thresholds
     ):
         self.daily_halt = daily_halt_pct
         self.weekly_halt = weekly_halt_pct
         self.monthly_review = monthly_review_pct
         self.soft_threshold = soft_scale_threshold
+        self._hysteresis = hysteresis
 
         self._nav_history: list[tuple[float, float]] = []   # (timestamp, nav)
         self._hwm: float = 0.0
@@ -56,6 +58,8 @@ class DrawdownController:
         """
         Record a new NAV observation and compute drawdown state.
         """
+        if nav <= 0:
+            raise ValueError(f"NAV must be positive, got {nav}")
         ts = timestamp or time.time()
         self._nav_history.append((ts, nav))
 
@@ -79,8 +83,9 @@ class DrawdownController:
             self._is_halted = True
             self._halt_reason = f"Weekly drawdown {weekly_dd:.1%} exceeds halt threshold {self.weekly_halt:.1%}"
             logger.error("STRATEGY HALTED: %s", self._halt_reason)
-        elif self._is_halted and weekly_dd > self.weekly_halt * 0.7:
-            # Allow resume when drawdown recovers to 70% of halt threshold
+        elif self._is_halted and weekly_dd > self.weekly_halt + self._hysteresis:
+            # Allow resume only when drawdown recovers above halt threshold + hysteresis band
+            # (hysteresis prevents rapid halt/resume oscillation near the threshold)
             self._is_halted = False
             self._halt_reason = ""
             logger.info("Drawdown recovered. Strategy can resume.")

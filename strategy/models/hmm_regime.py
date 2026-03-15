@@ -83,6 +83,7 @@ class HMMRegimeClassifier:
         X shape: (n_samples, n_features)
         lengths: list of sequence lengths for non-contiguous data
         """
+        assert self.n_states >= 3, f"n_states must be >= 3 for 3-regime labeling, got {self.n_states}"
         if X.shape[0] < self.n_states * 10:
             raise ValueError(
                 f"Need at least {self.n_states * 10} samples, got {X.shape[0]}"
@@ -135,21 +136,25 @@ class HMMRegimeClassifier:
         # BULL_CARRY = highest mean funding z-score
         # HIGH_VOL_CRISIS = highest mean volatility
         # SIDEWAYS = the remaining state
-        fr_zs = [s["mean_fr_z"] for s in state_stats]
-        vols = [s["mean_vol"] for s in state_stats]
+        fr_zs = np.array([s["mean_fr_z"] for s in state_stats])
+        vols = np.array([s["mean_vol"] for s in state_stats])
 
-        bull_state = int(np.argmax(fr_zs))
-        crisis_state = int(np.argmax(vols))
-        sideways_state = next(
-            i for i in range(self.n_states)
-            if i != bull_state and i != crisis_state
-        )
+        # Use argpartition for more stable selection (avoids full sort, O(n) complexity)
+        bull_state = int(np.argpartition(fr_zs, -1)[-1])   # index of max fr_z
+        crisis_state = int(np.argpartition(vols, -1)[-1])  # index of max vol
+
         if bull_state == crisis_state:
-            # Edge case: reassign
-            sorted_by_fr = sorted(range(self.n_states), key=lambda i: fr_zs[i])
-            bull_state = sorted_by_fr[-1]
-            crisis_state = sorted_by_fr[-2]
-            sideways_state = sorted_by_fr[0]
+            # Edge case: bull and crisis labels collide — resolve by ranking all states
+            # by funding z-score so all 3 assignments are distinct indices
+            sorted_by_fr = list(np.argpartition(fr_zs, [0, 1, 2]))  # ascending order
+            bull_state = int(sorted_by_fr[-1])     # highest funding z → bull
+            crisis_state = int(sorted_by_fr[-2])   # second-highest → crisis (vol proxy)
+            sideways_state = int(sorted_by_fr[0])  # lowest → sideways
+        else:
+            # Normal case: bull != crisis, sideways is whichever index is left
+            all_states = set(range(self.n_states))
+            remaining = all_states - {bull_state, crisis_state}
+            sideways_state = int(remaining.pop())
 
         self._state_map = {
             bull_state: MarketRegime.BULL_CARRY,

@@ -121,8 +121,11 @@ def kelly_position_size(
     """
     Compute Kelly criterion position size as a fraction of portfolio.
 
-    Full Kelly = μ / σ² (for normally distributed returns)
-    We use fractional Kelly (0.25) for more conservative sizing.
+    Full Kelly = μ / σ² (for log-normally distributed returns, where μ is the
+    expected log-return and σ² is its variance — equivalent to the continuous-time
+    Kelly formula assuming geometric Brownian motion for perp funding returns).
+    We use fractional Kelly (0.25 = quarter Kelly) for more conservative sizing,
+    reducing risk of ruin in the fat-tailed crypto environment.
 
     Args:
         expected_return: Expected return per period (e.g. funding APR / periods_per_year)
@@ -133,9 +136,11 @@ def kelly_position_size(
     Returns:
         Portfolio fraction [0, max_pct]
     """
-    if variance <= 0:
+    # Guard against near-zero or negative variance to avoid numerical instability
+    if variance < 1e-8:
         return 0.0
 
+    # Full Kelly = mu/sigma^2, using fractional Kelly for crypto risk management
     full_kelly = expected_return / variance
     fractional = full_kelly * fraction
     return float(np.clip(fractional, 0.0, max_pct))

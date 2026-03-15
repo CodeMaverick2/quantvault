@@ -93,6 +93,47 @@ class TestKalmanHedgeRatio:
         assert k.beta == pytest.approx(1.0)
 
 
+class TestKalmanRejectsInvalidInput:
+    def test_nan_price_returns_last_state_without_crashing(self):
+        """NaN price must not corrupt the Kalman state — returns last valid state."""
+        k = KalmanHedgeRatio()
+        state_before = k.update(100.0, 5.0)
+        state_nan = k.update(float("nan"), 5.0)
+        # Filter state must not have changed
+        assert state_nan.beta == pytest.approx(state_before.beta)
+        assert k.update_count == 1  # count unchanged after skipped update
+
+    def test_nan_spread_returns_last_state_without_crashing(self):
+        """NaN spread must not corrupt the Kalman state."""
+        k = KalmanHedgeRatio()
+        state_before = k.update(100.0, 5.0)
+        state_nan = k.update(100.0, float("nan"))
+        assert state_nan.beta == pytest.approx(state_before.beta)
+
+    def test_inf_price_returns_last_state(self):
+        k = KalmanHedgeRatio()
+        k.update(100.0, 5.0)
+        state = k.update(float("inf"), 5.0)
+        assert np.isfinite(state.beta)
+
+    def test_zero_price_raises(self):
+        k = KalmanHedgeRatio()
+        with pytest.raises(ValueError, match="price must be positive"):
+            k.update(0.0, 5.0)
+
+    def test_negative_price_raises(self):
+        k = KalmanHedgeRatio()
+        with pytest.raises(ValueError, match="price must be positive"):
+            k.update(-50.0, 5.0)
+
+    def test_nan_on_first_call_returns_default_state(self):
+        """NaN on first update (no prior state) returns a neutral default HedgeState."""
+        k = KalmanHedgeRatio(initial_beta=1.5)
+        state = k.update(float("nan"), 5.0)
+        # Should return a neutral default; beta is the initial value
+        assert np.isfinite(state.beta)
+
+
 class TestMultiAssetHedgeManager:
     def test_manage_multiple_symbols(self):
         mgr = MultiAssetHedgeManager(["SOL-PERP", "BTC-PERP", "ETH-PERP"])

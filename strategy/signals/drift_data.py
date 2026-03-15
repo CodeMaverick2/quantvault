@@ -77,9 +77,23 @@ class DriftDataClient:
         if self._session is None:
             raise RuntimeError("Use as async context manager")
         url = f"{self._base}{path}"
-        async with self._session.get(url, params=params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+        max_retries = 3
+        delays = [1.0, 2.0, 4.0]  # exponential backoff
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                async with self._session.get(url, params=params) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "Request to %s failed (attempt %d/%d): %s — retrying in %.0fs",
+                        url, attempt + 1, max_retries, exc, delays[attempt],
+                    )
+                    await asyncio.sleep(delays[attempt])
+        raise last_exc  # type: ignore[misc]
 
     async def get_funding_rates(
         self,
@@ -142,18 +156,17 @@ class DriftDataClient:
         symbols: list[str],
         limit: int = 200,
     ) -> dict[str, pd.DataFrame]:
-        """Fetch funding rates for multiple markets concurrently."""
-        tasks = {sym: self.get_funding_rates(sym, limit) for sym in symbols}
-        results = {}
-        for sym, coro in tasks.items():
+        """Fetch funding rates for multiple markets with true parallel execution via asyncio.gather."""
+        async def _fetch_one(sym: str) -> tuple[str, pd.DataFrame]:
             try:
-                records = await coro
-                df = self._records_to_df(records)
-                results[sym] = df
+                records = await self.get_funding_rates(sym, limit)
+                return sym, self._records_to_df(records)
             except Exception as exc:
                 logger.warning("Failed to fetch funding for %s: %s", sym, exc)
-                results[sym] = pd.DataFrame()
-        return results
+                return sym, pd.DataFrame()
+
+        pairs = await asyncio.gather(*(_fetch_one(sym) for sym in symbols))
+        return dict(pairs)
 
     # ------------------------------------------------------------------ #
     # Parsing helpers                                                      #

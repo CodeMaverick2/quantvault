@@ -136,6 +136,28 @@ class TestCascadeRiskScorer:
         pct = scorer.compute_percentile(50 * 0.0001, scorer._funding_history)
         assert 0.45 < pct < 0.55
 
+    def test_compute_percentile_empty_history_returns_neutral(self, scorer):
+        """compute_percentile with empty history must return 0.5 (neutral), not raise."""
+        pct = scorer.compute_percentile(0.001, [])
+        assert pct == pytest.approx(0.5)
+
+    def test_compute_percentile_short_history_returns_neutral(self, scorer):
+        """Fewer than 10 data points → neutral 0.5."""
+        pct = scorer.compute_percentile(0.001, [0.0005, 0.002])
+        assert pct == pytest.approx(0.5)
+
+    def test_basis_threshold_configurable(self):
+        """basis_threshold param changes when 'max' basis component is reached."""
+        scorer_tight = CascadeRiskScorer(basis_threshold=0.01)
+        scorer_loose = CascadeRiskScorer(basis_threshold=0.10)
+        inp = CascadeRiskInput(basis_pct=0.02)
+        # With tight threshold (1%), basis=0.02 → component = min(1, 0.02/0.01) = 1.0
+        r_tight = scorer_tight.score(inp)
+        # With loose threshold (10%), basis=0.02 → component = min(1, 0.02/0.10) = 0.2
+        r_loose = scorer_loose.score(inp)
+        assert r_tight.components["basis"] == pytest.approx(1.0)
+        assert r_loose.components["basis"] == pytest.approx(0.2)
+
 
 class TestKalmanPairTracker:
     def test_converges_to_true_beta(self):

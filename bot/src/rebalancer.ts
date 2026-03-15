@@ -5,6 +5,8 @@
 
 import logger from "./logger";
 import { DriftManager } from "./drift";
+import { VaultManager } from "./vault";
+import { OrderExecutor } from "./executor";
 import { StrategyEngineClient, AllocationResponse } from "./strategyClient";
 import {
   perpAllocationGauge,
@@ -32,12 +34,16 @@ const MARKET_INDEXES: Record<string, number> = {
 
 export class Rebalancer {
   private lastAllocation: AllocationResponse | null = null;
+  private readonly executor: OrderExecutor;
 
   constructor(
     private readonly drift: DriftManager,
+    private readonly vault: VaultManager,
     private readonly strategyClient: StrategyEngineClient,
     private readonly rebalanceThresholdPct: number = 0.05
-  ) {}
+  ) {
+    this.executor = new OrderExecutor(drift);
+  }
 
   async rebalance(emergencyExit: boolean = false): Promise<void> {
     const end = rebalanceDurationHistogram.startTimer();
@@ -92,7 +98,18 @@ export class Rebalancer {
       return;
     }
 
-    // 3. Execute perp adjustments
+    // 3. Rebalance vault lending allocations via Voltr SDK
+    try {
+      const lendingTargets: Record<string, number> = {
+        kamino: allocations.kamino_lending_pct,
+        drift_spot: allocations.drift_spot_lending_pct,
+      };
+      await this.vault.rebalanceToTargets(lendingTargets);
+    } catch (err) {
+      logger.error(`Vault lending rebalance failed (continuing with perp rebalance): ${err}`);
+    }
+
+    // 4. Execute perp adjustments via idempotent executor
     const snapshots = await this.drift.getAllMarketSnapshots();
 
     for (const [sym, targetPct] of Object.entries(allocations.perp_allocations)) {

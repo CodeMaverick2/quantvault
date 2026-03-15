@@ -65,8 +65,10 @@ class CascadeRiskScorer:
         self,
         trigger_threshold: float = 0.70,
         weights: dict[str, float] | None = None,
+        basis_threshold: float = 0.03,  # basis % at which basis component reaches max risk (1.0)
     ):
         self.trigger_threshold = trigger_threshold
+        self.basis_threshold = basis_threshold
         self.weights = weights or {
             "obi": 0.25,
             "funding": 0.25,
@@ -108,7 +110,7 @@ class CascadeRiskScorer:
         components["liquidation"] = inp.liquidation_percentile
 
         # Basis blowout: extreme basis indicates stress / dislocated market
-        components["basis"] = min(1.0, abs(inp.basis_pct) / 0.03)  # 3% basis = max
+        components["basis"] = min(1.0, abs(inp.basis_pct) / self.basis_threshold)
 
         # Weighted composite
         composite = sum(
@@ -124,7 +126,10 @@ class CascadeRiskScorer:
             components["book_depth"] > 0.70,
         ])
         if extreme_count >= 3:
-            composite = min(1.0, composite * 1.25)  # 25% amplification
+            # 1.25 amplification: when ≥3 signals are simultaneously extreme, cascade risk
+            # is non-linearly higher than the weighted sum suggests (correlated tail events
+            # amplify each other, as observed in the Oct 2025 liquidation cascade).
+            composite = min(1.0, composite * 1.25)
 
         triggered = composite >= self.trigger_threshold
         dominant = max(components, key=lambda k: self.weights.get(k, 0) * components[k])
@@ -161,6 +166,8 @@ class CascadeRiskScorer:
 
     def compute_percentile(self, value: float, history: list[float]) -> float:
         """Compute where `value` falls in the historical distribution."""
+        if not history:
+            return 0.5  # empty history → neutral
         if len(history) < 10:
             return 0.5  # insufficient history → neutral
         below = sum(1 for x in history if x <= value)

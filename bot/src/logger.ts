@@ -18,7 +18,7 @@ class RawStderrTransport extends Transport {
 }
 
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || "info",
+  level: (process.env.LOG_LEVEL || "info").toLowerCase(),
   transports: [
     new RawStderrTransport(),
     new winston.transports.File({

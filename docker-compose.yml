@@ -10,7 +10,7 @@ services:
       - "8000:8000"
     environment:
       - PORT=8000
-      - LOG_LEVEL=INFO
+      - LOG_LEVEL=info
     volumes:
       - ./models:/app/models
       - ./data:/app/data
@@ -37,7 +37,7 @@ services:
       - VAULT_ADDRESS=${VAULT_ADDRESS}
       - STRATEGY_ENGINE_URL=http://strategy-engine:8000
       - METRICS_PORT=9090
-      - LOG_LEVEL=INFO
+      - LOG_LEVEL=info
     volumes:
       - ./logs:/app/logs
     depends_on:

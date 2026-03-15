@@ -1,0 +1,79 @@
+# Environment
+.env
+.env.*
+*.key
+*.pem
+keypair.json
+wallet.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+plan.md
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# TypeScript / Node
+node_modules/
+dist/
+*.js.map
+*.tsbuildinfo
+
+# Rust / Anchor
+target/
+**/*.rs.bk
+.anchor/
+
+# Data & Models
+data/
+models/*.pkl
+models/*.pt
+models/*.joblib
+!models/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Docker
+.docker/
+
+# Devnet / Mainnet state
+config/vault_addresses.json
+
+# Trained model checkpoints (large binaries)
+models/*.json
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+coverage.xml
+bot/coverage/
+
+# Solana keypairs (never commit)
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!config/devnet.ts
+!config/mainnet.ts

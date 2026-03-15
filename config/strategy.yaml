@@ -1,0 +1,78 @@
+strategy:
+  name: "QuantVault AMDN"
+  version: "1.0.0"
+  base_asset: "USDC"
+  target_funding_apr_threshold: 10.0  # min APR to enter perp position
+  max_leverage: 2.0
+  min_health_buffer: 0.30             # 30% cushion above liquidation level
+
+hmm:
+  n_states: 3
+  covariance_type: "full"
+  n_iter: 2000
+  refit_interval_hours: 168           # weekly refit
+  lookback_days: 90
+  state_labels:
+    - "BULL_CARRY"
+    - "SIDEWAYS"
+    - "HIGH_VOL_CRISIS"
+
+kalman:
+  process_noise: 0.0001
+  observation_noise: 0.001
+  initial_state_mean: 1.0
+  initial_state_covariance: 1.0
+
+allocation:
+  min_lending_pct: 0.10
+  max_perp_pct: 0.60
+  rebalance_threshold_pct: 0.05
+  rebalance_interval_minutes: 10
+  emergency_rebalance_minutes: 1
+
+risk:
+  daily_drawdown_halt: -0.03
+  weekly_drawdown_halt: -0.07
+  monthly_drawdown_review: -0.15
+  cascade_risk_threshold: 0.70
+  max_basis_pct: 0.02
+  max_negative_funding_apr: -0.45
+  max_oracle_deviation_pct: 0.005
+  max_position_pct_nav: 0.30
+  circuit_breaker_cooldown_minutes: 60
+
+markets:
+  perp:
+    - symbol: "SOL-PERP"
+      market_index: 0
+      max_allocation_pct: 0.25
+      tier: "B"
+    - symbol: "BTC-PERP"
+      market_index: 1
+      max_allocation_pct: 0.25
+      tier: "A"
+    - symbol: "ETH-PERP"
+      market_index: 2
+      max_allocation_pct: 0.20
+      tier: "B"
+
+cointegration:
+  pairs:
+    - ["SOL-PERP", "BTC-PERP"]
+    - ["ETH-PERP", "BTC-PERP"]
+  entry_z_score: 2.0
+  exit_z_score: 0.5
+  stop_loss_z_score: 4.0
+  max_allocation_pct: 0.15
+  refit_days: 30
+
+lending:
+  kamino:
+    adaptor: "to6Eti9CsC5FGkAtqiPphvKD2hiQiLsS8zWiDBqBPKR"
+    priority: 1
+    max_pct: 0.40
+  drift_spot:
+    adaptor: "EBN93eXs5fHGBABuajQqdsKRkCgaqtJa8vEFD6vKXiP"
+    market_index: 0
+    priority: 2
+    max_pct: 0.30

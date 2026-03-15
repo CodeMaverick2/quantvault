@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  strategy-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.strategy
+    container_name: quantvault-strategy
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./config:/app/config
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  keeper-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: quantvault-keeper
+    ports:
+      - "9090:9090"
+    environment:
+      - CLUSTER=${CLUSTER:-devnet}
+      - RPC_URL=${RPC_URL}
+      - WS_URL=${WS_URL}
+      - KEEPER_PRIVATE_KEY=${KEEPER_PRIVATE_KEY}
+      - VAULT_ADDRESS=${VAULT_ADDRESS}
+      - STRATEGY_ENGINE_URL=http://strategy-engine:8000
+      - METRICS_PORT=9090
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      strategy-engine:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  models:
+  data:
+  logs:

@@ -41,6 +41,9 @@ from .signals.funding_features import build_features, get_hmm_feature_matrix
 from .signals.funding_persistence import FundingPersistenceScorer
 from .signals.ar_funding_predictor import ARFundingPredictor
 from .signals.tod_optimizer import TimeOfDayOptimizer
+from .signals.multi_horizon_forecaster import MultiHorizonForecaster
+from .signals.regime_transition import RegimeTransitionForecaster
+from .signals.leading_indicators import LeadingIndicatorEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,6 +181,12 @@ _ar_predictor = ARFundingPredictor(breakeven_apr=22.0)
 # Time-of-day optimizer — concentrates positions in historically rich UTC windows
 _tod_optimizer = TimeOfDayOptimizer()
 
+# Predictive signal stack (Layers 8–10)
+# Feed these every cycle; graceful degradation if not enough history
+_mh_forecaster = MultiHorizonForecaster()        # AR(4) iterative 1/6/24/72h forecast
+_transition_forecaster = RegimeTransitionForecaster()  # HMM A^N transition probs
+_leading_engine = LeadingIndicatorEngine()        # OI + basis + liquidation leads
+
 # Threading/async safety locks
 _market_state_lock = asyncio.Lock()
 _regime_lock = asyncio.Lock()
@@ -233,6 +242,7 @@ class MarketUpdateRequest(BaseModel):
     open_interest: float = 0.0
     book_depth: float = 1.0
     lending_apr: float = 0.0
+    liq_volume_1h: float = 0.0   # liquidation volume in last hour (USD, optional)
 
 
 class NavUpdateRequest(BaseModel):
@@ -339,6 +349,33 @@ async def get_signals():
         },
         "circuit_breaker": circuit_breaker.state.value,
         "cb_scale": circuit_breaker.get_position_multiplier(),
+        "predictive_signals": {
+            sym: {
+                "trajectory": mhf.trajectory.value if hasattr(mhf, "trajectory") else "FLAT",
+                "pre_position": mhf.pre_position_signal if hasattr(mhf, "pre_position_signal") else False,
+                "exit_signal": mhf.exit_signal if hasattr(mhf, "exit_signal") else False,
+                "f1h": mhf.forecasts[1].predicted_apr if 1 in mhf.forecasts else None,
+                "f6h": mhf.forecasts[6].predicted_apr if 6 in mhf.forecasts else None,
+                "f24h": mhf.forecasts[24].predicted_apr if 24 in mhf.forecasts else None,
+            }
+            for sym, mhf in _mh_forecaster.forecast_all(SYMBOLS).items()
+        },
+        "regime_transition": {
+            "warning": _transition_forecaster.forecast().warning.value,
+            "trans_6h": _transition_forecaster.forecast().transition_prob_6h,
+            "trans_24h": _transition_forecaster.forecast().transition_prob_24h,
+            "expected_hours": _transition_forecaster.forecast().expected_transition_hours,
+        },
+        "leading_indicators": {
+            sym: {
+                "signal": r.signal.value,
+                "composite_score": r.composite_score,
+                "pre_position_carry": r.pre_position_carry,
+                "pre_exit_carry": r.pre_exit_carry,
+                "pre_position_inverse": r.pre_position_inverse,
+            }
+            for sym, r in _leading_engine.analyze_all(SYMBOLS).items()
+        },
         "market_states": {
             sym: {
                 "funding_apr": state["funding_apr"],
@@ -411,6 +448,18 @@ async def get_allocations():
     # Time-of-day multiplier: concentrate perp sizing in high-yield UTC windows
     tod_mult = _tod_optimizer.current_multiplier()
 
+    # Update regime transition forecaster with current regime (feeds A^N matrix)
+    if _latest_regime is not None:
+        _transition_forecaster.update(
+            regime=_latest_regime.regime.name,
+            confidence=_latest_regime.confidence,
+        )
+
+    # Gather predictive signals (all gracefully degrade on cold start)
+    mh_forecasts = _mh_forecaster.forecast_all(SYMBOLS)
+    transition_forecast = _transition_forecaster.forecast()
+    leading_signals = _leading_engine.analyze_all(SYMBOLS)
+
     result = optimizer.compute(
         markets=markets,
         regime=regime,
@@ -422,6 +471,9 @@ async def get_allocations():
         fast_regime=fast_r,
         fast_confidence=fast_c,
         tod_multiplier=tod_mult,
+        multi_horizon_forecasts=mh_forecasts,
+        regime_transition=transition_forecast,
+        leading_indicators=leading_signals,
     )
 
     return {
@@ -487,6 +539,20 @@ async def update_market(req: MarketUpdateRequest):
         oracle_price=req.oracle_price,
         symbol=req.symbol,
     )
+
+    # Feed leading indicators (OI + basis + liquidation pre-signals)
+    if req.open_interest > 0 or req.oracle_price > 0:
+        perp_price = req.oracle_price * (1.0 + req.basis_pct)
+        _leading_engine.update(
+            symbol=req.symbol,
+            oi=req.open_interest,
+            perp_price=perp_price if perp_price > 0 else req.oracle_price,
+            spot_price=req.oracle_price,
+            liq_volume_1h=req.liq_volume_1h,
+        )
+
+    # Keep multi-horizon forecaster current with live funding
+    _mh_forecaster.update(req.symbol, req.funding_apr)
 
     return {
         "cascade_risk": cascade_result.score,
@@ -604,9 +670,11 @@ async def _fetch_and_update_market_data():
             basis = float(latest.get("basis_pct", 0.0))
             z_score = float(latest.get("fr_z_24h", 0.0)) if "fr_z_24h" in latest else 0.0
 
-            # Feed all historical APRs to AR predictor for model warmup
+            # Feed all historical APRs to AR predictor and multi-horizon forecaster for warmup
             for _, row in df.iterrows():
-                _ar_predictor.update(sym, float(row.get("apr", 0.0)))
+                row_apr = float(row.get("apr", 0.0))
+                _ar_predictor.update(sym, row_apr)
+                _mh_forecaster.update(sym, row_apr)
 
             # Update persistence scorer and time-of-day optimizer
             _persistence_scorer.update(sym, apr, basis_pct=basis, z_score=z_score)

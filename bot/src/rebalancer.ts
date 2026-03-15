@@ -132,18 +132,27 @@ export class Rebalancer {
       }
 
       try {
+        const orderId = OrderExecutor.newOrderId();
         if (delta > 0) {
-          // Need to increase short position
           logger.info(`${sym}: increase short by $${delta.toFixed(0)}`);
-          await this.drift.openShortPerp(
-            MARKET_INDEXES[sym] ?? 0,
-            delta,
-            snap.oraclePrice
-          );
+          await this.executor.placeOrder({
+            id: orderId,
+            marketIndex: MARKET_INDEXES[sym] ?? 0,
+            direction: "short",
+            sizeUsd: delta,
+            status: "pending",
+            attempts: 0,
+          }, snap.oraclePrice);
         } else {
-          // Need to reduce short position
           logger.info(`${sym}: reduce short by $${Math.abs(delta).toFixed(0)}`);
-          await this.drift.closePosition(MARKET_INDEXES[sym] ?? 0, snap.oraclePrice);
+          await this.executor.placeOrder({
+            id: orderId,
+            marketIndex: MARKET_INDEXES[sym] ?? 0,
+            direction: "long",
+            sizeUsd: Math.abs(delta),
+            status: "pending",
+            attempts: 0,
+          }, snap.oraclePrice);
         }
       } catch (err) {
         logger.error(`Failed to adjust ${sym} position: ${err}`);
@@ -157,13 +166,21 @@ export class Rebalancer {
         if (!snap) continue;
         logger.info(`Closing ${pos.symbol}: not in target allocation`);
         try {
-          await this.drift.closePosition(pos.marketIndex, snap.oraclePrice);
+          await this.executor.placeOrder({
+            id: OrderExecutor.newOrderId(),
+            marketIndex: pos.marketIndex,
+            direction: "long",
+            sizeUsd: 0,   // closePosition ignores sizeUsd — closes entire position
+            status: "pending",
+            attempts: 0,
+          }, snap.oraclePrice);
         } catch (err) {
           logger.error(`Failed to close ${pos.symbol}: ${err}`);
         }
       }
     }
 
+    this.executor.pruneTerminalOrders();
     this.lastAllocation = allocations;
   }
 

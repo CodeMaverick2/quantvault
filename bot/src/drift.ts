@@ -245,7 +245,7 @@ export class DriftManager {
       const snap = snapshots[pos.symbol];
       if (!snap) continue;
       try {
-        await this.closePosition(pos.marketIndex, snap.oraclePrice);
+        await this.closePosition(pos.marketIndex, snap.oraclePrice, "emergency");
       } catch (err) {
         logger.error(`Failed to close position for ${pos.symbol}: ${err}`);
       }

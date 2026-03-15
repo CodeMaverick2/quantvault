@@ -41,6 +41,7 @@ export interface MarketUpdateRequest {
   open_interest?: number;
   book_depth?: number;
   lending_apr?: number;
+  liq_volume_1h?: number;   // liquidation volume last hour (USD) — feeds leading indicator engine
 }
 
 export interface MarketUpdateResponse {

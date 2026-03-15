@@ -428,6 +428,7 @@ async def get_allocations():
         "kamino_lending_pct": result.kamino_lending_pct,
         "drift_spot_lending_pct": result.drift_spot_lending_pct,
         "perp_allocations": result.perp_allocations,
+        "perp_directions": result.perp_directions,  # SHORT or LONG (inverse carry)
         "total_perp_pct": result.total_perp_pct,
         "total_lending_pct": result.total_lending_pct,
         "regime": result.regime,

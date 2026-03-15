@@ -16,11 +16,19 @@ def make_markets(
     btc_apr: float = 15.0,
     eth_apr: float = 12.0,
     cascade_risk: float = 0.2,
+    persistence_score: float = 0.8,
+    consecutive_positive: int = 6,
 ) -> list[MarketYieldData]:
     return [
-        MarketYieldData("SOL-PERP", sol_apr, 6.0, True, cascade_risk),
-        MarketYieldData("BTC-PERP", btc_apr, 6.0, True, cascade_risk),
-        MarketYieldData("ETH-PERP", eth_apr, 6.0, True, cascade_risk),
+        MarketYieldData("SOL-PERP", sol_apr, 6.0, True, cascade_risk,
+                        persistence_score=persistence_score,
+                        consecutive_positive=consecutive_positive),
+        MarketYieldData("BTC-PERP", btc_apr, 6.0, True, cascade_risk,
+                        persistence_score=persistence_score,
+                        consecutive_positive=consecutive_positive),
+        MarketYieldData("ETH-PERP", eth_apr, 6.0, True, cascade_risk,
+                        persistence_score=persistence_score,
+                        consecutive_positive=consecutive_positive),
     ]
 
 

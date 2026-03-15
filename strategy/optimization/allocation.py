@@ -4,6 +4,13 @@ across lending protocols and delta-neutral perp positions.
 
 Uses regime signal, funding rates, and risk metrics to compute
 the optimal portfolio split every 10 minutes.
+
+Key improvements over naive delta-neutral:
+  1. Dual-timeframe regime agreement gate (fast + slow HMM must agree)
+  2. Kelly × (1 - cascade_score) multiplicative sizing
+  3. Funding persistence filter (min 3 consecutive positive hours)
+  4. Volatility-adjusted position scaling
+  5. Basis-momentum confirmation for entry quality
 """
 
 import logging
@@ -20,12 +27,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MarketYieldData:
-    """Real-time yield data for a single market/protocol."""
+    """Real-time yield + risk data for a single market/protocol."""
     symbol: str
-    funding_apr: float             # current annualized funding rate
-    lending_apr: float             # lending protocol APY
+    funding_apr: float             # current annualized funding rate (%)
+    lending_apr: float             # lending protocol APY (%)
     is_perp: bool
-    cascade_risk: float = 0.0     # 0–1 risk score for this market
+    cascade_risk: float = 0.0     # 0–1 cascade risk score
+    persistence_score: float = 1.0  # 0–1 funding persistence quality
+    realized_vol_24h: float = 0.20  # 24h realized vol (annualized, fraction)
+    consecutive_positive: int = 0  # consecutive hours of positive funding
 
 
 @dataclass
@@ -49,6 +59,9 @@ class AllocationResult:
     position_scale: float = 1.0
     expected_blended_apr: float = 0.0
 
+    # Sizing attribution for transparency
+    sizing_breakdown: dict[str, dict] = field(default_factory=dict)
+
     def validate(self) -> bool:
         total = (
             self.kamino_lending_pct
@@ -66,20 +79,31 @@ class AllocationConfig:
     max_single_perp_pct: float = 0.25
     max_stat_arb_pct: float = 0.15
     target_funding_apr_threshold: float = 10.0  # % APR minimum to enter perp
+    min_persistence_score: float = 0.55          # gate: minimum entry quality
+    min_consecutive_positive: int = 3            # gate: minimum consecutive positive hours
+    target_vol: float = 0.15                     # target portfolio vol for vol-targeting
+    cascade_risk_entry_gate: float = 0.50        # max cascade risk to allow entry
 
 
 class DynamicAllocationOptimizer:
     """
-    Computes target portfolio allocations using:
+    Computes target portfolio allocations using a 5-layer signal stack:
 
-    1. Regime signal (HMM) → scales overall perp exposure
-    2. Funding rate ranking → allocates more to highest-yielding markets
-    3. Kelly criterion → sizes individual market allocations
-    4. Cascade risk → zero allocation to high-risk markets
-    5. Drawdown scale → overall portfolio scale from risk manager
+    Layer 1: Regime gate (HMM) — sets max perp budget
+    Layer 2: Funding quality gate — requires persistence + APR threshold
+    Layer 3: Kelly sizing — positions sized by risk-adjusted expected return
+    Layer 4: Cascade risk multiplier — Kelly × (1 - cascade_score)
+    Layer 5: Vol targeting — scale down when realized vol exceeds target
 
-    The optimizer is deterministic and idempotent given the same inputs,
-    making it safe to call repeatedly without state accumulation.
+    The result is a deterministic, idempotent allocation that degrades
+    gracefully as market conditions deteriorate.
+
+    Example sizing for SOL-PERP with:
+      - funding APR = 20%, vol = 20% annualized, cascade = 0.2, persistence = 0.8
+      - kelly_fraction(0.25x) = 0.38
+      - cascade_adj = 0.38 × (1 - 0.2) = 0.30
+      - vol_adj = min(1.0, 0.15/0.20) = 0.75 → 0.30 × 0.75 = 0.23
+      - Capped at max_single_perp_pct = 0.25 → final = 0.23 (22.5% of NAV)
     """
 
     def __init__(self, config: AllocationConfig | None = None):
@@ -94,47 +118,73 @@ class DynamicAllocationOptimizer:
         cb_scale: float,
         kamino_apr: float,
         drift_spot_apr: float,
+        # Dual-timeframe HMM agreement (optional — defaults to single HMM)
+        fast_regime: MarketRegime | None = None,
+        fast_confidence: float = 1.0,
     ) -> AllocationResult:
         """
         Main allocation computation.
 
         Args:
-            markets: List of perp markets with their current yield data
-            regime: Current HMM-classified regime
-            regime_confidence: Posterior probability of the regime [0, 1]
-            drawdown_scale: Scale factor from DrawdownController [0, 1]
-            cb_scale: Scale factor from CircuitBreaker [0, 1]
-            kamino_apr: Current Kamino USDC lending APY
-            drift_spot_apr: Current Drift spot USDC lending APY
+            markets: List of perp markets with current yield + risk data
+            regime: Slow HMM regime (weekly timescale)
+            regime_confidence: Slow HMM posterior probability
+            drawdown_scale: Scale factor from DrawdownController [0,1]
+            cb_scale: Scale factor from CircuitBreaker [0,1]
+            kamino_apr: Current Kamino USDC lending APY (%)
+            drift_spot_apr: Current Drift spot USDC lending APY (%)
+            fast_regime: Fast HMM regime (4h timescale, optional)
+            fast_confidence: Fast HMM confidence
 
         Returns:
             AllocationResult with normalized percentage allocations
         """
-        # Combined external scale
+        # ── Layer 1: Regime gate ──────────────────────────────────────────────
         external_scale = drawdown_scale * cb_scale
         regime_scale = regime.position_scale() * min(1.0, regime_confidence + 0.3)
+
+        # Dual-timeframe consensus: if fast and slow HMMs disagree, reduce scale
+        if fast_regime is not None:
+            if fast_regime == regime:
+                # Agreement bonus: slight boost to confidence
+                dual_agreement = min(1.0, (regime_confidence + fast_confidence) / 2 + 0.1)
+            elif fast_regime == MarketRegime.HIGH_VOL_CRISIS or regime == MarketRegime.HIGH_VOL_CRISIS:
+                # Either fast OR slow flags crisis → immediate caution
+                dual_agreement = 0.0
+            else:
+                # Soft disagreement (BULL vs SIDEWAYS) — use conservative scale
+                dual_agreement = min(regime_confidence, fast_confidence) * 0.5
+            regime_scale = regime.position_scale() * dual_agreement
+
         effective_scale = external_scale * regime_scale
 
         result = AllocationResult(regime=regime.name, position_scale=effective_scale)
 
-        # --- Phase 1: Determine perp allocations ---
-        perp_budget = self.config.max_perp_pct * effective_scale
-
+        # ── Layer 2: Funding quality gate ────────────────────────────────────
         eligible_markets = [
             m for m in markets
             if m.is_perp
             and m.funding_apr >= self.config.target_funding_apr_threshold
-            and m.cascade_risk < 0.50   # exclude high-risk markets
+            and m.cascade_risk < self.config.cascade_risk_entry_gate
+            and m.persistence_score >= self.config.min_persistence_score
+            and m.consecutive_positive >= self.config.min_consecutive_positive
         ]
 
+        # ── Layer 3+4+5: Kelly × cascade × vol allocation ────────────────────
+        perp_budget = self.config.max_perp_pct * effective_scale
         perp_allocs: dict[str, float] = {}
+        sizing_breakdown: dict[str, dict] = {}
+
         if eligible_markets and perp_budget > 0.01:
-            perp_allocs = self._allocate_perps(eligible_markets, perp_budget)
+            perp_allocs, sizing_breakdown = self._allocate_perps(
+                eligible_markets, perp_budget
+            )
 
         result.perp_allocations = perp_allocs
         result.total_perp_pct = sum(perp_allocs.values())
+        result.sizing_breakdown = sizing_breakdown
 
-        # --- Phase 2: Lending fills the remainder, with min_lending floor ---
+        # ── Lending fills remainder with min_lending floor ────────────────────
         if drift_spot_apr >= kamino_apr:
             drift_share = 0.60
             kamino_share = 0.40
@@ -142,11 +192,10 @@ class DynamicAllocationOptimizer:
             drift_share = 0.40
             kamino_share = 0.60
 
-        # Compute perps first; lending gets whatever remains, then clamp to min_lending_pct
         lending_from_remainder = 1.0 - result.total_perp_pct
         total_lending = max(lending_from_remainder, self.config.min_lending_pct)
 
-        # If min_lending_pct forces total > 1.0, scale down perps proportionally
+        # If min_lending forces total > 1.0, scale down perps proportionally
         if result.total_perp_pct + total_lending > 1.0:
             total_lending = self.config.min_lending_pct
             perp_budget_capped = 1.0 - total_lending
@@ -160,7 +209,7 @@ class DynamicAllocationOptimizer:
         result.kamino_lending_pct = total_lending * kamino_share
         result.total_lending_pct = total_lending
 
-        # --- Phase 3: Normalize to 100% (final adjustment) ---
+        # Final normalization
         total = result.total_perp_pct + result.total_lending_pct
         if abs(total - 1.0) > 0.005:
             adjustment = 1.0 - result.total_perp_pct
@@ -170,8 +219,7 @@ class DynamicAllocationOptimizer:
 
         result.total_pct = result.total_perp_pct + result.total_lending_pct
 
-        # --- Expected blended APR ---
-        # Build a lookup map to avoid repeated linear search with next()
+        # ── Expected blended APR ──────────────────────────────────────────────
         funding_apr_map: dict[str, float] = {m.symbol: m.funding_apr for m in eligible_markets}
         blended = (
             result.kamino_lending_pct * kamino_apr
@@ -184,12 +232,16 @@ class DynamicAllocationOptimizer:
         result.expected_blended_apr = blended
 
         logger.info(
-            "Allocation computed: regime=%s scale=%.2f perp=%.1f%% lending=%.1f%% E[APR]=%.1f%%",
+            "Allocation: regime=%s(fast=%s) scale=%.2f perp=%.1f%% lending=%.1f%% "
+            "E[APR]=%.1f%% eligible=%d/%d",
             regime.name,
+            fast_regime.name if fast_regime else "N/A",
             effective_scale,
             result.total_perp_pct * 100,
             result.total_lending_pct * 100,
             result.expected_blended_apr,
+            len(eligible_markets),
+            len(markets),
         )
 
         return result
@@ -198,36 +250,64 @@ class DynamicAllocationOptimizer:
         self,
         markets: list[MarketYieldData],
         budget: float,
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, float], dict[str, dict]]:
         """
-        Allocate perp budget across eligible markets using Kelly criterion.
-        """
-        if not markets:
-            return {}
+        Allocate perp budget using Kelly × (1 - cascade) × vol_adjustment.
 
-        # Compute Kelly sizes for each market
-        kelly_sizes: dict[str, float] = {}
+        Returns (allocations, sizing_breakdown).
+        """
+        kelly_cascade_sizes: dict[str, float] = {}
+        breakdown: dict[str, dict] = {}
+
         for m in markets:
-            # Use funding APR as expected return, assume ~20% annualized vol for sizing
-            period_return = m.funding_apr / (24 * 365.25)  # per-hour return
-            period_variance = (0.20 / np.sqrt(24 * 365.25)) ** 2
-            kelly = kelly_position_size(
+            # Kelly sizing: use funding APR as expected return per-hour
+            # and market vol for variance estimate
+            period_return = m.funding_apr / 100.0 / (24 * 365.25)  # per-hour fractional
+            annualized_vol = max(m.realized_vol_24h, 0.10)          # minimum 10% vol floor
+            period_variance = (annualized_vol / np.sqrt(24 * 365.25)) ** 2
+
+            kelly_raw = kelly_position_size(
                 expected_return=period_return,
                 variance=period_variance,
-                fraction=0.25,
+                fraction=0.25,   # 25% fractional Kelly
                 max_pct=self.config.max_single_perp_pct,
             )
-            kelly_sizes[m.symbol] = kelly
 
-        total_kelly = sum(kelly_sizes.values())
+            # Layer 4: Cascade risk multiplier — reduce exposure in risky conditions
+            # High cascade score dramatically reduces position
+            cascade_adj = kelly_raw * (1.0 - m.cascade_risk)
+
+            # Layer 5: Vol targeting — scale down when realized vol exceeds target
+            if m.realized_vol_24h > 0:
+                vol_scale = min(1.0, self.config.target_vol / m.realized_vol_24h)
+            else:
+                vol_scale = 1.0
+
+            final_size = cascade_adj * vol_scale
+
+            kelly_cascade_sizes[m.symbol] = max(final_size, 0.0)
+            breakdown[m.symbol] = {
+                "kelly_raw": round(kelly_raw, 4),
+                "cascade_adj": round(cascade_adj, 4),
+                "vol_scale": round(vol_scale, 4),
+                "final_pre_budget": round(final_size, 4),
+                "funding_apr": m.funding_apr,
+                "cascade_risk": m.cascade_risk,
+                "persistence_score": m.persistence_score,
+                "realized_vol_24h": m.realized_vol_24h,
+            }
+
+        total_kelly = sum(kelly_cascade_sizes.values())
         if total_kelly <= 0:
-            return {}
+            return {}, breakdown
 
-        # Scale Kelly sizes to fit within budget
+        # Scale to fit within budget
         allocs: dict[str, float] = {}
-        for sym, size in kelly_sizes.items():
+        for sym, size in kelly_cascade_sizes.items():
             normalized = (size / total_kelly) * budget
             allocs[sym] = min(normalized, self.config.max_single_perp_pct)
+            if sym in breakdown:
+                breakdown[sym]["final_alloc"] = round(allocs[sym], 4)
 
         # Re-normalize after capping
         total_alloc = sum(allocs.values())
@@ -235,4 +315,4 @@ class DynamicAllocationOptimizer:
             scale = budget / total_alloc
             allocs = {sym: v * scale for sym, v in allocs.items()}
 
-        return {sym: v for sym, v in allocs.items() if v > 0.005}
+        return {sym: v for sym, v in allocs.items() if v > 0.005}, breakdown

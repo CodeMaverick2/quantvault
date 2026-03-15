@@ -395,70 +395,224 @@ def print_summary(metrics: dict) -> None:
     print(SEPARATOR)
 
 
+# ── Scenario simulation ───────────────────────────────────────────────────────
+
+SCENARIO_PARAMS: dict[str, dict] = {
+    "bear": {
+        "label": "Bear Market / HIGH_VOL_CRISIS",
+        "description": "Negative SOL funding, high vol, crisis regime. Strategy shifts to lending-only.",
+        "regime_override": "HIGH_VOL_CRISIS",
+        "funding_apr_overrides": {"SOL-PERP": -8.0, "BTC-PERP": 2.0, "ETH-PERP": 1.0},
+        "lending_apr": 8.0,
+    },
+    "sideways": {
+        "label": "Sideways / Consolidation",
+        "description": "Moderate positive funding, reduced perp allocation, mixed lending.",
+        "regime_override": "SIDEWAYS",
+        "funding_apr_overrides": {"SOL-PERP": 12.0, "BTC-PERP": 10.0, "ETH-PERP": 8.0},
+        "lending_apr": 7.5,
+    },
+    "bull": {
+        "label": "Bull Market / BULL_CARRY",
+        "description": "Strong positive funding across all markets. Full perp + lending stack active.",
+        "regime_override": "BULL_CARRY",
+        "funding_apr_overrides": {"SOL-PERP": 45.0, "BTC-PERP": 28.0, "ETH-PERP": 22.0},
+        "lending_apr": 9.0,
+    },
+}
+
+
+def run_scenario(
+    n_hours: int,
+    initial_nav: float,
+    scenario: dict,
+) -> dict:
+    """
+    Run a regime-specific scenario simulation with fixed funding rates.
+    Returns performance metrics dict.
+    """
+    regime = scenario["regime_override"]
+    alloc = REGIME_ALLOCATIONS.get(regime, REGIME_ALLOCATIONS["SIDEWAYS"])
+    funding_aprs: dict[str, float] = scenario["funding_apr_overrides"]
+    lending_apr: float = scenario["lending_apr"]
+
+    nav = initial_nav
+    hourly_funding_total = 0.0
+    hourly_lending_total = 0.0
+    nav_series = []
+
+    perp_alloc: dict[str, float] = alloc.get("perp", {})
+    kamino_pct: float = alloc.get("kamino", 0.0)
+    drift_spot_pct: float = alloc.get("drift_spot", 0.0)
+    total_lending_pct = kamino_pct + drift_spot_pct
+
+    for _ in range(n_hours):
+        # Funding income
+        hourly_funding = sum(
+            nav * pct * max(funding_aprs.get(sym, 0.0), 0.0) / 100.0 / HOURS_PER_YEAR
+            for sym, pct in perp_alloc.items()
+        )
+        # Lending income
+        hourly_lending = nav * total_lending_pct * lending_apr / 100.0 / HOURS_PER_YEAR
+
+        # Small tx cost per rebalance (once per 10 hours on average)
+        tx_cost = nav * TX_COST_PCT if (_ % 10 == 0) else 0.0
+
+        nav += hourly_funding + hourly_lending - tx_cost
+        hourly_funding_total += hourly_funding
+        hourly_lending_total += hourly_lending
+        nav_series.append(nav)
+
+    nav_arr = np.array(nav_series)
+    # Daily returns from daily-sampled NAV
+    daily_nav = nav_arr[23::24] if len(nav_arr) >= 24 else nav_arr
+    daily_returns = np.diff(daily_nav) / daily_nav[:-1]
+
+    total_return_pct = (nav / initial_nav - 1.0) * 100.0
+    n_days = n_hours // 24
+
+    if len(daily_returns) > 1 and daily_returns.std() > 0:
+        sharpe = float(daily_returns.mean() / daily_returns.std() * np.sqrt(365))
+    else:
+        sharpe = 0.0
+
+    rolling_max = np.maximum.accumulate(daily_nav)
+    drawdowns = (daily_nav - rolling_max) / rolling_max
+    max_dd = float(drawdowns.min() * 100.0)
+
+    avg_daily_apr = float(daily_returns.mean() * 365.0 * 100.0) if len(daily_returns) > 0 else 0.0
+    annualized_apy = float((nav / initial_nav) ** (365.0 / max(n_days, 1)) - 1.0) * 100.0
+
+    return {
+        "regime": regime,
+        "n_days": n_days,
+        "initial_nav": initial_nav,
+        "final_nav": round(nav, 2),
+        "total_return_pct": round(total_return_pct, 2),
+        "annualized_apy": round(annualized_apy, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "max_drawdown_pct": round(max_dd, 2),
+        "avg_daily_apr_pct": round(avg_daily_apr, 2),
+        "total_funding_income": round(hourly_funding_total, 2),
+        "total_lending_income": round(hourly_lending_total, 2),
+        "perp_pct": sum(perp_alloc.values()),
+        "lending_pct": total_lending_pct,
+    }
+
+
+def print_scenario_comparison(scenario_results: dict[str, dict]) -> None:
+    """Print a side-by-side scenario comparison table."""
+    sep = "=" * 80
+    print(f"\n{sep}")
+    print("  QuantVault AMDN — Multi-Regime Scenario Analysis (90-day projection)")
+    print(sep)
+    header = f"  {'Metric':<28}"
+    for name in scenario_results:
+        header += f"  {name.upper():>14}"
+    print(header)
+    print("-" * 80)
+
+    rows = [
+        ("Regime", "regime"),
+        ("Annualized APY", "annualized_apy", "%"),
+        ("90-day Return", "total_return_pct", "%"),
+        ("Sharpe Ratio", "sharpe_ratio"),
+        ("Max Drawdown", "max_drawdown_pct", "%"),
+        ("Perp Allocation", "perp_pct", "×100%"),
+        ("Lending Allocation", "lending_pct", "×100%"),
+    ]
+
+    for row in rows:
+        key = row[1]
+        label = row[0]
+        fmt = row[2] if len(row) > 2 else ""
+        line = f"  {label:<28}"
+        for name, res in scenario_results.items():
+            val = res.get(key, "N/A")
+            if fmt == "%" and isinstance(val, (int, float)):
+                line += f"  {val:>13.1f}%"
+            elif fmt == "×100%" and isinstance(val, (int, float)):
+                line += f"  {val * 100:>12.0f}%"
+            else:
+                line += f"  {str(val):>14}"
+        print(line)
+
+    print(sep)
+    print()
+    print("  Notes:")
+    for name, scenario in SCENARIO_PARAMS.items():
+        print(f"    {name.upper()}: {scenario['description']}")
+    print()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="QuantVault AMDN Strategy Backtester")
     parser.add_argument(
-        "--days",
-        type=int,
-        default=90,
+        "--days", type=int, default=90,
         help="Number of trailing days to simulate (default: 90)",
     )
     parser.add_argument(
-        "--initial-nav",
-        type=float,
-        default=100_000.0,
+        "--initial-nav", type=float, default=100_000.0,
         help="Starting vault NAV in USD (default: 100000)",
     )
     parser.add_argument(
-        "--symbols",
-        nargs="+",
-        default=SYMBOLS,
+        "--symbols", nargs="+", default=SYMBOLS,
         help="Perp market symbols to include",
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=RESULTS_CSV,
-        help="Path for backtest results CSV (default: data/backtest_results.csv)",
+        "--output", type=Path, default=RESULTS_CSV,
+        help="Path for backtest results CSV",
+    )
+    parser.add_argument(
+        "--scenarios", action="store_true",
+        help="Run multi-regime scenario projections in addition to historical backtest",
     )
     args = parser.parse_args()
 
     logger.info("=== QuantVault AMDN Backtester ===")
     logger.info("Days: %d | Initial NAV: $%.0f | Symbols: %s", args.days, args.initial_nav, args.symbols)
 
-    # ── Load data ─────────────────────────────────────────────────────────────
+    # ── Historical backtest ────────────────────────────────────────────────────
     df = load_feature_data(args.symbols)
-
-    # ── Load or mock HMM model ─────────────────────────────────────────────────
     hmm_model = load_hmm_model()
-
-    # ── Run simulation ─────────────────────────────────────────────────────────
     hourly_result = run_simulation(
-        df=df,
-        hmm_model=hmm_model,
-        days=args.days,
-        initial_nav=args.initial_nav,
-        symbols=args.symbols,
+        df=df, hmm_model=hmm_model, days=args.days,
+        initial_nav=args.initial_nav, symbols=args.symbols,
     )
-
-    # ── Compute metrics ────────────────────────────────────────────────────────
     metrics = compute_metrics(hourly_result, initial_nav=args.initial_nav)
 
-    # ── Save CSV ───────────────────────────────────────────────────────────────
     DATA_DIR.mkdir(exist_ok=True)
     daily_nav = compute_daily_nav(hourly_result).reset_index()
     daily_nav.columns = ["date", "nav"]
     daily_nav["daily_return_pct"] = daily_nav["nav"].pct_change() * 100.0
     daily_nav["cumulative_return_pct"] = (daily_nav["nav"] / args.initial_nav - 1.0) * 100.0
-
     daily_nav.to_csv(args.output, index=False)
     logger.info("Daily NAV series saved to %s", args.output)
 
-    # ── Print summary ──────────────────────────────────────────────────────────
     print_summary(metrics)
-    print(f"\n  Results CSV: {args.output}\n")
+    print(f"\n  Results CSV: {args.output}")
+
+    # ── Scenario projections ───────────────────────────────────────────────────
+    if args.scenarios:
+        n_hours_90d = 90 * 24
+        scenario_results = {
+            name: run_scenario(n_hours_90d, args.initial_nav, params)
+            for name, params in SCENARIO_PARAMS.items()
+        }
+        print_scenario_comparison(scenario_results)
+
+        # Append scenario summary to CSV
+        scenario_csv = DATA_DIR / "scenario_results.csv"
+        import csv
+        with open(scenario_csv, "w", newline="") as f:
+            if scenario_results:
+                writer = csv.DictWriter(f, fieldnames=list(next(iter(scenario_results.values())).keys()))
+                writer.writeheader()
+                for name, res in scenario_results.items():
+                    writer.writerow({"regime": name, **res})
+        logger.info("Scenario results saved to %s", scenario_csv)
 
 
 if __name__ == "__main__":

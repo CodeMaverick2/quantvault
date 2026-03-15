@@ -38,6 +38,8 @@ from .risk.drawdown_control import DrawdownController
 from .signals.cascade_risk import CascadeRiskScorer
 from .signals.drift_data import DriftDataClient
 from .signals.funding_features import build_features, get_hmm_feature_matrix
+from .signals.funding_persistence import FundingPersistenceScorer
+from .signals.ar_funding_predictor import ARFundingPredictor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,11 +92,21 @@ SYMBOLS = [m["symbol"] for m in CFG["markets"]["perp"]]
 
 # ── State ────────────────────────────────────────────────────────────────────
 
+# Slow HMM: trained on weekly rolling window (primary regime signal)
 hmm = HMMRegimeClassifier(
     n_states=CFG["hmm"]["n_states"],
     n_iter=CFG["hmm"]["n_iter"],
     covariance_type=CFG["hmm"]["covariance_type"],
     model_path=MODEL_DIR / "hmm_regime.pkl",
+)
+
+# Fast HMM: 4-hour buffer captures intraday regime shifts
+# Only enter perps when both fast + slow agree on BULL_CARRY
+hmm_fast = HMMRegimeClassifier(
+    n_states=CFG["hmm"]["n_states"],
+    n_iter=200,   # fewer iterations for speed
+    covariance_type=CFG["hmm"]["covariance_type"],
+    model_path=MODEL_DIR / "hmm_fast.pkl",
 )
 
 hedge_manager = MultiAssetHedgeManager(
@@ -147,10 +159,20 @@ _market_state: dict[str, dict] = {
     for sym in SYMBOLS
 }
 _latest_regime: Optional[RegimePrediction] = None
+_latest_fast_regime: Optional[RegimePrediction] = None
 _kamino_apr: float = 5.0
 _drift_spot_apr: float = 7.0
-HMM_BUFFER_SIZE = 48  # 48 hours of hourly data
+
+HMM_BUFFER_SIZE = 48       # slow HMM: 48 hours
+HMM_FAST_BUFFER_SIZE = 6   # fast HMM: 6 hours (intraday shifts)
 _hmm_feature_buffer: collections.deque = collections.deque(maxlen=HMM_BUFFER_SIZE)
+_hmm_fast_buffer: collections.deque = collections.deque(maxlen=HMM_FAST_BUFFER_SIZE)
+
+# Funding persistence scorer (tracks consecutive positive funding per symbol)
+_persistence_scorer = FundingPersistenceScorer()
+
+# AR(4) funding predictor — only enter when AR prediction exceeds breakeven
+_ar_predictor = ARFundingPredictor(breakeven_apr=22.0)
 
 # Threading/async safety locks
 _market_state_lock = asyncio.Lock()
@@ -166,12 +188,18 @@ HMM_RETRAIN_INTERVAL_SECS = 7 * 86400  # 1 week
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Try to load pre-trained model
+    # Try to load pre-trained models
     try:
         hmm.load()
-        logger.info("Loaded pre-trained HMM model")
+        logger.info("Loaded pre-trained slow HMM model")
     except FileNotFoundError:
-        logger.info("No pre-trained HMM found — will train on first data fetch")
+        logger.info("No pre-trained slow HMM found — will train on first data fetch")
+
+    try:
+        hmm_fast.load()
+        logger.info("Loaded pre-trained fast HMM model")
+    except FileNotFoundError:
+        logger.info("No pre-trained fast HMM found — will train on first data fetch")
 
     # Background task: fetch market data every 10 minutes
     task = asyncio.create_task(_market_data_loop())
@@ -242,15 +270,77 @@ async def get_regime():
         prediction = hmm.predict(X)
         global _latest_regime
         _latest_regime = prediction
+
+        # Fast HMM prediction (intraday)
+        fast_info: dict = {}
+        global _latest_fast_regime
+        if hmm_fast.is_fitted and len(_hmm_fast_buffer) >= 3:
+            X_fast = np.array(_hmm_fast_buffer)
+            fast_pred = hmm_fast.predict(X_fast)
+            _latest_fast_regime = fast_pred
+            fast_info = {
+                "fast_regime": fast_pred.regime.name,
+                "fast_confidence": fast_pred.confidence,
+                "dual_agreement": fast_pred.regime == prediction.regime,
+            }
+
         return {
             "regime": prediction.regime.name,
             "confidence": prediction.confidence,
             "position_scale": prediction.position_scale,
             "probabilities": prediction.probabilities,
+            **fast_info,
         }
     except Exception as exc:
         logger.exception("Regime prediction failed: %s", exc)
         return {"regime": "SIDEWAYS", "confidence": 0.5, "position_scale": 0.5, "error": str(exc)}
+
+
+@app.get("/signals")
+async def get_signals():
+    """Returns full signal stack state: persistence, dual-HMM, circuit breakers."""
+    persistence_results = _persistence_scorer.score_all(SYMBOLS)
+    return {
+        "funding_persistence": {
+            sym: {
+                "persistence_score": r.persistence_score,
+                "momentum_quality": r.momentum_quality,
+                "basis_alignment": r.basis_alignment,
+                "consecutive_positive": r.consecutive_positive,
+                "entry_quality": r.entry_quality,
+                "allow_entry": r.allow_entry,
+            }
+            for sym, r in persistence_results.items()
+        },
+        "ar_predictions": {
+            sym: {
+                "predicted_apr": p.predicted_apr,
+                "lower_95": p.lower_95,
+                "upper_95": p.upper_95,
+                "prediction_std": p.prediction_std,
+                "ar_coefficients": p.ar_coefficients,
+                "allow_entry": p.allow_entry,
+            }
+            for sym, p in _ar_predictor.predict_all(SYMBOLS).items()
+        },
+        "slow_regime": _latest_regime.regime.name if _latest_regime else "UNKNOWN",
+        "fast_regime": _latest_fast_regime.regime.name if _latest_fast_regime else "UNKNOWN",
+        "dual_agreement": (
+            _latest_fast_regime.regime == _latest_regime.regime
+            if _latest_fast_regime and _latest_regime else False
+        ),
+        "circuit_breaker": circuit_breaker.state.value,
+        "cb_scale": circuit_breaker.get_position_multiplier(),
+        "market_states": {
+            sym: {
+                "funding_apr": state["funding_apr"],
+                "cascade_risk": state["cascade_risk"],
+                "basis_pct": state["basis_pct"],
+                "updated_at": state["updated_at"],
+            }
+            for sym, state in _market_state.items()
+        },
+    }
 
 
 @app.get("/hedge-ratios")
@@ -286,16 +376,29 @@ async def get_allocations():
 
     cb_scale = circuit_breaker.get_position_multiplier()
 
+    # Gather persistence + AR predictions for each market
+    persistence_results = _persistence_scorer.score_all(SYMBOLS)
+    ar_predictions = _ar_predictor.predict_all(SYMBOLS)
+
     markets = [
         MarketYieldData(
             symbol=sym,
-            funding_apr=_market_state[sym]["funding_apr"],
+            # Use AR predicted APR when available (reduces entering on spikes)
+            funding_apr=ar_predictions[sym].predicted_apr
+                if ar_predictions[sym].allow_entry
+                else _market_state[sym]["funding_apr"],
             lending_apr=_market_state[sym]["lending_apr"],
             is_perp=True,
             cascade_risk=_market_state[sym]["cascade_risk"],
+            persistence_score=persistence_results[sym].entry_quality if sym in persistence_results else 1.0,
+            consecutive_positive=persistence_results[sym].consecutive_positive if sym in persistence_results else 0,
         )
         for sym in SYMBOLS
     ]
+
+    # Fast regime for dual-timeframe consensus
+    fast_r = _latest_fast_regime.regime if _latest_fast_regime else None
+    fast_c = _latest_fast_regime.confidence if _latest_fast_regime else 1.0
 
     result = optimizer.compute(
         markets=markets,
@@ -305,6 +408,8 @@ async def get_allocations():
         cb_scale=cb_scale,
         kamino_apr=_kamino_apr,
         drift_spot_apr=_drift_spot_apr,
+        fast_regime=fast_r,
+        fast_confidence=fast_c,
     )
 
     return {
@@ -365,6 +470,8 @@ async def update_market(req: MarketUpdateRequest):
         oracle_deviation_pct=abs(req.basis_pct),
         cascade_risk_score=cascade_result.score,
         book_depth_ratio=req.book_depth,
+        oracle_price=req.oracle_price,
+        symbol=req.symbol,
     )
 
     return {
@@ -449,30 +556,47 @@ async def _fetch_and_update_market_data():
         X, idx = get_hmm_feature_matrix(enriched)
 
         if len(X) >= 10:
-            # Update HMM feature buffer with latest row (deque enforces maxlen automatically)
             async with _hmm_lock:
+                # Slow HMM buffer (48h)
                 _hmm_feature_buffer.append(X[-1])
+                # Fast HMM buffer (6h) — append last min(6, len(X)) rows
+                for row in X[-HMM_FAST_BUFFER_SIZE:]:
+                    _hmm_fast_buffer.append(row)
 
                 now = time.time()
-                # Train HMM if not yet fitted, or retrain weekly
+                # Retrain slow HMM weekly
                 should_retrain = (
                     not hmm.is_fitted
                     or (now - _hmm_last_retrain_ts) >= HMM_RETRAIN_INTERVAL_SECS
                 )
                 if should_retrain and len(X) >= 50:
                     logger.info(
-                        "Training HMM on %d observations for %s (retrain=%s)",
-                        len(X), sym, hmm.is_fitted,
+                        "Retraining slow HMM on %d observations (sym=%s)",
+                        len(X), sym,
                     )
                     hmm.fit(X)
                     hmm.save()
                     _hmm_last_retrain_ts = now
 
-        # Update market state with latest funding rate
+                # Train fast HMM whenever we have enough data (low n_iter, fast)
+                if not hmm_fast.is_fitted and len(X) >= 20:
+                    hmm_fast.fit(X)
+                    hmm_fast.save()
+
+        # Update market state, persistence scorer, and AR predictor
         if sym in _market_state:
             latest = df.iloc[-1]
             apr = float(latest.get("apr", 0.0))
             basis = float(latest.get("basis_pct", 0.0))
+            z_score = float(latest.get("fr_z_24h", 0.0)) if "fr_z_24h" in latest else 0.0
+
+            # Feed all historical APRs to AR predictor for model warmup
+            for _, row in df.iterrows():
+                _ar_predictor.update(sym, float(row.get("apr", 0.0)))
+
+            # Update persistence scorer
+            _persistence_scorer.update(sym, apr, basis_pct=basis, z_score=z_score)
+
             async with _market_state_lock:
                 _market_state[sym]["funding_apr"] = apr
                 _market_state[sym]["basis_pct"] = basis

@@ -58,6 +58,10 @@ class CircuitBreakerConfig:
     min_book_depth_ratio: float = 0.30
     # Cooldown after trigger fires
     cooldown_secs: int = 3600  # 1 hour
+    # Oracle manipulation defense: reject if oracle moves > N sigma in 1 slot
+    # Based on Mango Markets exploit lessons — non-negotiable on Solana
+    oracle_move_sigma_threshold: float = 3.0
+    oracle_move_window: int = 10  # rolling window for sigma estimation
 
 
 class CircuitBreaker:
@@ -71,6 +75,9 @@ class CircuitBreaker:
         self._state: CircuitBreakerState = CircuitBreakerState.NORMAL
         self._events: list[CircuitBreakerEvent] = []
         self._last_trigger_ts: float = 0.0
+        # Oracle manipulation defense: rolling oracle price history per symbol
+        from collections import deque
+        self._oracle_history: dict[str, deque] = {}
 
     @property
     def state(self) -> CircuitBreakerState:
@@ -84,6 +91,60 @@ class CircuitBreaker:
     def active_events(self) -> list[CircuitBreakerEvent]:
         return [e for e in self._events if e.is_active]
 
+    def check_oracle_manipulation(self, symbol: str, oracle_price: float) -> bool:
+        """
+        Returns True if oracle price movement exceeds sigma threshold (potential manipulation).
+
+        Defense against Mango Markets-style oracle manipulation on Solana.
+        Drift uses Pyth oracles with on-chain price history — we track our own
+        rolling window as a secondary validation layer.
+
+        A legitimate oracle move of >3 sigma in a single update is extremely rare
+        (p < 0.003 for normal distribution) and should trigger immediate halt.
+        """
+        from collections import deque
+        import numpy as np
+
+        if symbol not in self._oracle_history:
+            self._oracle_history[symbol] = deque(maxlen=self.config.oracle_move_window)
+
+        history = self._oracle_history[symbol]
+        history.append(oracle_price)
+
+        if len(history) < 3:
+            return False  # insufficient history to detect manipulation
+
+        prices = list(history)
+        returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
+        if len(returns) < 2:
+            return False
+
+        import numpy as np
+        returns_arr = np.array(returns)
+        mean_ret = float(np.mean(returns_arr[:-1]))  # exclude last for comparison
+        std_ret = float(np.std(returns_arr[:-1]))
+
+        if std_ret < 1e-10:
+            return False
+
+        last_return = returns[-1]
+        sigma_move = abs(last_return - mean_ret) / std_ret
+
+        if sigma_move > self.config.oracle_move_sigma_threshold:
+            logger.warning(
+                "ORACLE_MANIPULATION_SUSPECTED: %s price moved %.2f sigma in 1 slot "
+                "(price=%.4f, z=%.1f, threshold=%.1f)",
+                symbol, sigma_move, oracle_price, sigma_move,
+                self.config.oracle_move_sigma_threshold,
+            )
+            self._log_event(
+                "ORACLE_MANIPULATION",
+                sigma_move,
+                self.config.oracle_move_sigma_threshold,
+            )
+            return True
+        return False
+
     def check(
         self,
         funding_apr: float,
@@ -91,6 +152,8 @@ class CircuitBreaker:
         oracle_deviation_pct: float,
         cascade_risk_score: float,
         book_depth_ratio: float,
+        oracle_price: float = 0.0,
+        symbol: str = "",
     ) -> tuple[CircuitBreakerState, list[str]]:
         """
         Run all circuit breaker checks.
@@ -145,6 +208,13 @@ class CircuitBreaker:
                 f"LIQUIDITY_COLLAPSE: depth_ratio={book_depth_ratio:.2f} < threshold {self.config.min_book_depth_ratio:.2f}"
             )
             self._log_event("LIQUIDITY_COLLAPSE", book_depth_ratio, self.config.min_book_depth_ratio)
+
+        # Check 6: Oracle manipulation (Mango Markets defense)
+        if oracle_price > 0 and symbol:
+            if self.check_oracle_manipulation(symbol, oracle_price):
+                triggered_checks.append(
+                    f"ORACLE_MANIPULATION: suspected price manipulation for {symbol}"
+                )
 
         if triggered_checks:
             self._state = CircuitBreakerState.TRIGGERED

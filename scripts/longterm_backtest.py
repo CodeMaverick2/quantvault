@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # ── Constants (same as backtest.py) ───────────────────────────────────────────
 
 HOURS_PER_YEAR = 8_760.0
-TX_COST_PCT = 0.00001
+TX_COST_PCT = 0.00007  # 0.007% of NAV per rebalance: Drift Tier 1 taker 0.035% × 2 (open+close)
 REBALANCE_INTERVAL_HOURS = 10
 INVERSE_CARRY_THRESHOLD = 5.0     # % APR — activate inverse carry below this
 INVERSE_CARRY_BORROW_COST = 5.0   # % APR — borrow cost to short the spot

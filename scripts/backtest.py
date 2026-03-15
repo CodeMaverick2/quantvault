@@ -9,7 +9,7 @@ Simulates 90 days of strategy operation over historical data:
       funding_income  = sum(perp_allocation * funding_apr / 8760) per hour
       inverse_income  = sum(inv_perp_alloc * |negative_funding| / 8760) - borrow_cost
       lending_income  = sum(lending_allocation * lending_apr / 8760) per hour
-      tx_costs        = 0.001% per rebalance
+      tx_costs        = 0.007% of NAV per rebalance (Drift Tier 1 taker 0.035% × 2)
 
 Strategy Modes:
   BULL_CARRY:      SHORT perp (collect +funding) + lending base yield
@@ -90,7 +90,7 @@ REGIME_ALLOCATIONS: dict[str, dict] = {
     },
 }
 
-TX_COST_PCT = 0.00001          # 0.001% per rebalance
+TX_COST_PCT = 0.00007          # 0.007% of NAV per rebalance: Drift Tier 1 taker 0.035% × 2 (open+close) on ~10% NAV position change
 REBALANCE_INTERVAL_HOURS = 10
 HOURS_PER_YEAR = 8_760.0
 

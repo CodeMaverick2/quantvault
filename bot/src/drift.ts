@@ -23,6 +23,7 @@ import {
 } from "@drift-labs/sdk";
 import { PublicKey, Connection } from "@solana/web3.js";
 import logger from "./logger";
+import { PriorityFeeManager, FeeUrgency } from "./priority_fees";
 
 export interface PerpPosition {
   marketIndex: number;
@@ -55,7 +56,8 @@ export class DriftManager {
       SOL: 0,
       BTC: 1,
       ETH: 2,
-    }
+    },
+    private readonly feeMgr?: PriorityFeeManager,
   ) {}
 
   async getMarketSnapshot(marketIndex: number, symbol: string): Promise<MarketSnapshot> {
@@ -147,7 +149,8 @@ export class DriftManager {
     marketIndex: number,
     sizeUsd: number,
     oraclePrice: number,
-    slippageBps: number = 50
+    slippageBps: number = 50,
+    urgency: FeeUrgency = "normal",
   ): Promise<string> {
     const baseSize = sizeUsd / oraclePrice;
     const baseAmountBn = new BN(Math.floor(baseSize * BASE_PRECISION.toNumber()));
@@ -169,12 +172,17 @@ export class DriftManager {
       postOnly: false,
     });
 
-    const tx = await this.driftClient.placePerpOrder(orderParams);
+    const txParams = await this._buildTxParams(urgency, "openPerp");
+    const tx = await this.driftClient.placePerpOrder(orderParams, txParams);
     logger.info(`Short perp order placed: ${tx}`);
     return tx;
   }
 
-  async closePosition(marketIndex: number, oraclePrice: number): Promise<string> {
+  async closePosition(
+    marketIndex: number,
+    oraclePrice: number,
+    urgency: FeeUrgency = "normal",
+  ): Promise<string> {
     const pos = this.user.getPerpPosition(marketIndex);
     if (!pos || pos.baseAssetAmount.isZero()) {
       logger.info(`No position to close for market ${marketIndex}`);
@@ -198,9 +206,34 @@ export class DriftManager {
       reduceOnly: true,
     });
 
-    const tx = await this.driftClient.placePerpOrder(orderParams);
+    const txParams = await this._buildTxParams(urgency, "closePerp");
+    const tx = await this.driftClient.placePerpOrder(orderParams, txParams);
     logger.info(`Close position order placed for market ${marketIndex}: ${tx}`);
     return tx;
+  }
+
+  // ── Private helpers ─────────────────────────────────────────────────────────
+
+  /**
+   * Build Drift SDK txParams with dynamic compute budget.
+   * Falls back to hardcoded values if no PriorityFeeManager is configured.
+   */
+  private async _buildTxParams(
+    urgency: FeeUrgency,
+    opType: "openPerp" | "closePerp" | "rebalance" | "emergencyExit" | "default" = "default",
+  ): Promise<{ computeUnits: number; computeUnitsPrice: number }> {
+    if (this.feeMgr) {
+      const fee = await this.feeMgr.estimate(urgency, opType);
+      return { computeUnits: fee.cuLimit, computeUnitsPrice: fee.microLamportsPerCU };
+    }
+    // Static fallback: conservative values to ensure inclusion during moderate congestion
+    const fallbackPrice: Record<FeeUrgency, number> = {
+      routine:   1_000,
+      normal:   10_000,
+      urgent:  200_000,
+      emergency: 1_000_000,
+    };
+    return { computeUnits: 400_000, computeUnitsPrice: fallbackPrice[urgency] };
   }
 
   async closeAllPositions(): Promise<void> {
@@ -229,13 +262,18 @@ export class DriftManager {
     return convertToNumber(free, QUOTE_PRECISION);
   }
 
-  async getHealthRate(marketIndex: number): Promise<number> {
+  /**
+   * Returns Drift health as a percentage (0–100).
+   * Formula: Health% = 100 × (1 − maintenance_margin_req / total_collateral)
+   * Health = 0% → liquidation threshold. Health = 100% → no positions.
+   */
+  async getHealthRate(_marketIndex: number): Promise<number> {
     const totalCollateral = this.user.getTotalCollateral("Maintenance");
     const maintenanceReq = this.user.getMaintenanceMarginRequirement();
-    if (maintenanceReq.isZero()) return Infinity;
-    return (
-      convertToNumber(totalCollateral, QUOTE_PRECISION) /
-      convertToNumber(maintenanceReq, QUOTE_PRECISION)
-    );
+    if (maintenanceReq.isZero()) return 100.0;
+    const collateralNum = convertToNumber(totalCollateral, QUOTE_PRECISION);
+    const reqNum = convertToNumber(maintenanceReq, QUOTE_PRECISION);
+    if (collateralNum <= 0) return 0.0;
+    return Math.max(0.0, (1.0 - reqNum / collateralNum) * 100.0);
   }
 }

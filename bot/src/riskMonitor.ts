@@ -30,7 +30,7 @@ export class RiskMonitor {
   constructor(
     private readonly drift: DriftManager,
     private readonly strategyClient: StrategyEngineClient,
-    private readonly minHealthRate: number = 1.30
+    private readonly minHealthRate: number = 30  // Drift Health% — alert below 30%
   ) {}
 
   async runCheck(): Promise<RiskStatus> {

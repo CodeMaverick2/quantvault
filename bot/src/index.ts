@@ -17,6 +17,7 @@ import { AnchorProvider } from "@coral-xyz/anchor";
 import logger from "./logger";
 import { StrategyEngineClient } from "./strategyClient";
 import { DriftManager } from "./drift";
+import { PriorityFeeManager } from "./priority_fees";
 import { VaultManager } from "./vault";
 import { Rebalancer } from "./rebalancer";
 import { RiskMonitor } from "./riskMonitor";
@@ -80,7 +81,9 @@ async function main() {
 
   // ── Service wiring ───────────────────────────────────────────────────────
   const strategyClient = new StrategyEngineClient(strategyUrl);
-  const driftMgr = new DriftManager(driftClient, user);
+  // Watch the Drift program account for accurate per-account priority fee estimation
+  const feeMgr = new PriorityFeeManager(connection, [driftClient.program.programId]);
+  const driftMgr = new DriftManager(driftClient, user, undefined, feeMgr);
   const vaultMgr = new VaultManager(
     connection,
     keypair,

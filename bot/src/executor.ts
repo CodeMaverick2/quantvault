@@ -13,6 +13,7 @@
 import { v4 as uuidv4 } from "uuid";
 import logger from "./logger";
 import { DriftManager } from "./drift";
+import { FeeUrgency } from "./priority_fees";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -107,6 +108,10 @@ export class OrderExecutor {
         `(id: ${record.id})`
       );
 
+      // Escalate fee urgency with each retry: normal → urgent → emergency
+      const urgencyLevels: FeeUrgency[] = ["normal", "urgent", "emergency"];
+      const urgency: FeeUrgency = urgencyLevels[Math.min(attempt - 1, 2)];
+
       try {
         let txSig: string;
 
@@ -114,12 +119,14 @@ export class OrderExecutor {
           txSig = await this.drift.openShortPerp(
             record.marketIndex,
             record.sizeUsd,
-            oraclePrice
+            oraclePrice,
+            50,       // slippageBps
+            urgency,
           );
         } else {
           // Long perp — close an existing short or open a long.
           // For the delta-neutral strategy "long" means closing a short.
-          txSig = await this.drift.closePosition(record.marketIndex, oraclePrice);
+          txSig = await this.drift.closePosition(record.marketIndex, oraclePrice, urgency);
         }
 
         record.status = "submitted";

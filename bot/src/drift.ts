@@ -49,8 +49,8 @@ export interface MarketSnapshot {
 
 export class DriftManager {
   constructor(
-    private readonly driftClient: DriftClient,
-    private readonly user: User,
+    private readonly driftClient: any,  // DriftClient
+    private readonly user: any,          // User
     private readonly marketIndexes: { SOL: number; BTC: number; ETH: number } = {
       SOL: 0,
       BTC: 1,

@@ -34,25 +34,28 @@ async def fetch_market_data(
     client: DriftDataClient,
 ) -> pd.DataFrame:
     """Fetch all available funding rate + candle data for a symbol."""
-    logger.info("Fetching %d days of data for %s...", days, symbol)
+    logger.info("Fetching %d days of data for %s via pagination...", days, symbol)
 
-    all_funding = []
     end_dt = datetime.now(tz=timezone.utc)
     start_dt = end_dt - timedelta(days=days)
+    min_ts = int(start_dt.timestamp())
 
-    # Fetch day by day (API max 750 per request, ~31 records/day at hourly)
-    current = start_dt
-    while current <= end_dt:
-        try:
-            records = await client.get_funding_rates_date(
-                symbol, current.year, current.month, current.day
-            )
-            all_funding.extend(records)
-            logger.debug("%s %s: %d records", symbol, current.date(), len(records))
-        except Exception as e:
-            logger.warning("Failed to fetch %s for %s: %s", symbol, current.date(), e)
-        current += timedelta(days=1)
-        await asyncio.sleep(0.1)  # rate limit
+    try:
+        all_funding = await client.get_funding_rates_paginated(symbol, min_ts)
+    except Exception as e:
+        logger.warning("Paginated fetch failed for %s, falling back to daily: %s", symbol, e)
+        all_funding = []
+        current = start_dt
+        while current <= end_dt:
+            try:
+                records = await client.get_funding_rates_date(
+                    symbol, current.year, current.month, current.day
+                )
+                all_funding.extend(records)
+            except Exception as ex:
+                logger.warning("Failed to fetch %s for %s: %s", symbol, current.date(), ex)
+            current += timedelta(days=1)
+            await asyncio.sleep(0.1)
 
     if not all_funding:
         logger.warning("No data fetched for %s", symbol)

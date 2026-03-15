@@ -175,8 +175,8 @@ class LSTMFundingPredictor:
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            use_label_encoder=False,
             eval_metric="logloss",
+            early_stopping_rounds=30,
             random_state=42,
         )
         split = int(len(X) * 0.85)
@@ -186,7 +186,8 @@ class LSTMFundingPredictor:
             verbose=False,
         )
         self._xgb = xgb
-        logger.info("XGBoost trained. Best iteration: %d", xgb.best_iteration)
+        best_iter = getattr(xgb, "best_iteration", xgb.n_estimators)
+        logger.info("XGBoost trained. Best iteration: %d", best_iter)
 
     def predict(
         self,

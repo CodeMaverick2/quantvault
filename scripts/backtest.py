@@ -272,20 +272,22 @@ def run_simulation(
         total_lending_pct = kamino_pct + drift_spot_pct
 
         # Funding income: short perp collects positive funding
+        # funding_apr is in percentage units (e.g., 15.0 = 15%), so divide by 100
         hourly_funding = 0.0
         for sym, alloc_pct in perp_alloc.items():
             apr_col = f"{sym}__apr"
             funding_apr = float(row.get(apr_col, 0.0)) if not pd.isna(row.get(apr_col)) else 0.0
-            hourly_funding += nav * alloc_pct * max(funding_apr, 0.0) / HOURS_PER_YEAR
+            hourly_funding += nav * alloc_pct * max(funding_apr, 0.0) / 100.0 / HOURS_PER_YEAR
 
         # Lending income: kamino + drift spot (use per-symbol lending APR if available)
+        # DEFAULT_LENDING_APR is in percentage units (e.g., 8.0 = 8%), so divide by 100
         lending_apr_col = f"{symbols[0]}__lending_apr"
         lending_apr = (
             float(row.get(lending_apr_col, DEFAULT_LENDING_APR))
             if not pd.isna(row.get(lending_apr_col, np.nan))
             else DEFAULT_LENDING_APR
         )
-        hourly_lending = nav * total_lending_pct * lending_apr / HOURS_PER_YEAR
+        hourly_lending = nav * total_lending_pct * lending_apr / 100.0 / HOURS_PER_YEAR
 
         # ── Update NAV ────────────────────────────────────────────────────────
         nav += hourly_funding + hourly_lending - tx_cost

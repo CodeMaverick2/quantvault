@@ -36,7 +36,7 @@ async function main() {
   logger.info("=== QuantVault Keeper Bot Starting ===");
 
   // ── Config ──────────────────────────────────────────────────────────────
-  const clusterEnv = (process.env.CLUSTER ?? "devnet") as DriftEnv;
+  const clusterEnv = (process.env.CLUSTER ?? "devnet") as any;  // DriftEnv
   const rpcUrl =
     process.env.RPC_URL ??
     (clusterEnv === "mainnet-beta"

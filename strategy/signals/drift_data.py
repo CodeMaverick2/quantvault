@@ -29,13 +29,19 @@ class FundingRateRecord:
 
     @property
     def hourly_rate(self) -> float:
-        """Convert 8h funding rate to hourly equivalent."""
-        return self.funding_rate / 8.0
+        """Hourly fractional funding rate (normalized by oracle price).
+
+        Drift API returns fundingRate in USDC-per-base-unit per period (1h on v2).
+        Dividing by oracle price gives the dimensionless fractional rate.
+        """
+        if self.oracle_twap == 0:
+            return 0.0
+        return self.funding_rate / self.oracle_twap
 
     @property
     def apr(self) -> float:
-        """Annualized funding rate as APR."""
-        return self.hourly_rate * 24 * 365.25
+        """Annualized funding rate as APR (percentage)."""
+        return self.hourly_rate * 8760 * 100
 
     @property
     def basis_pct(self) -> float:
@@ -102,7 +108,7 @@ class DriftDataClient:
     ) -> list[FundingRateRecord]:
         """Fetch latest funding rate records for a market."""
         data = await self._get(f"/market/{symbol}/fundingRates", {"limit": limit})
-        records = data if isinstance(data, list) else data.get("fundingRates", [])
+        records = data if isinstance(data, list) else data.get("records", data.get("fundingRates", []))
         return [self._parse_funding(r) for r in records]
 
     async def get_funding_rates_date(
@@ -114,8 +120,43 @@ class DriftDataClient:
     ) -> list[FundingRateRecord]:
         """Fetch funding rates for a specific date."""
         data = await self._get(f"/market/{symbol}/fundingRates/{year}/{month}/{day}")
-        records = data if isinstance(data, list) else data.get("fundingRates", [])
+        records = data if isinstance(data, list) else data.get("records", data.get("fundingRates", []))
         return [self._parse_funding(r) for r in records]
+
+    async def get_funding_rates_paginated(
+        self,
+        symbol: str,
+        min_ts: int,
+    ) -> list[FundingRateRecord]:
+        """Fetch all funding rate records newer than min_ts using cursor pagination."""
+        all_records: list[FundingRateRecord] = []
+        next_page: str | None = None
+
+        while True:
+            params: dict = {"limit": MAX_RECORDS_PER_REQUEST}
+            if next_page:
+                params["nextPage"] = next_page
+
+            data = await self._get(f"/market/{symbol}/fundingRates", params)
+            raw_list = data if isinstance(data, list) else data.get("records", data.get("fundingRates", []))
+            batch = [self._parse_funding(r) for r in raw_list]
+
+            # Stop if we've reached records older than min_ts
+            new_records = [r for r in batch if r.ts >= min_ts]
+            all_records.extend(new_records)
+
+            if len(new_records) < len(batch):
+                # We hit the cutoff timestamp — done
+                break
+
+            meta = data.get("meta", {}) if isinstance(data, dict) else {}
+            next_page = meta.get("nextPage")
+            if not next_page:
+                break
+
+            await asyncio.sleep(0.1)  # rate limit
+
+        return all_records
 
     async def get_candles(
         self,
@@ -181,8 +222,8 @@ class DriftDataClient:
             funding_rate_short=float(raw.get("fundingRateShort", 0)),
             cumulative_long=float(raw.get("cumulativeFundingRateLong", 0)),
             cumulative_short=float(raw.get("cumulativeFundingRateShort", 0)),
-            mark_twap=float(raw.get("markTwap", 0)),
-            oracle_twap=float(raw.get("oracleTwap", 0)),
+            mark_twap=float(raw.get("markPriceTwap", raw.get("markTwap", 0))),
+            oracle_twap=float(raw.get("oraclePriceTwap", raw.get("oracleTwap", 0))),
             period_revenue=float(raw.get("periodRevenue", 0)),
         )
 

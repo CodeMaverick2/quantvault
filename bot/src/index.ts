@@ -11,7 +11,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import { Connection, Keypair } from "@solana/web3.js";
-import { DriftClient, Wallet, initialize, DriftEnv } from "@drift-labs/sdk";
+import { DriftClient, Wallet, initialize, DriftEnv, BulkAccountLoader } from "@drift-labs/sdk";
 import { AnchorProvider } from "@coral-xyz/anchor";
 
 import logger from "./logger";
@@ -66,7 +66,10 @@ async function main() {
     connection,
     wallet,
     env: clusterEnv,
-    accountSubscription: { type: "websocket" },
+    accountSubscription: {
+      type: "polling",
+      accountLoader: new BulkAccountLoader(connection, "confirmed", 1000),
+    },
     perpMarketIndexes: [0, 1, 2],
     spotMarketIndexes: [0, 1],
     oracleInfos: sdkConfig.PERP_MARKETS.slice(0, 3).map((m: any) => ({

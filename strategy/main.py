@@ -360,12 +360,13 @@ async def get_signals():
             }
             for sym, mhf in _mh_forecaster.forecast_all(SYMBOLS).items()
         },
-        "regime_transition": {
-            "warning": _transition_forecaster.forecast().warning.value,
-            "trans_6h": _transition_forecaster.forecast().transition_prob_6h,
-            "trans_24h": _transition_forecaster.forecast().transition_prob_24h,
-            "expected_hours": _transition_forecaster.forecast().expected_transition_hours,
-        },
+        "regime_transition": (lambda f: {
+            "warning": f.warning.value,
+            "trans_6h": f.transition_probs.get(6, 0.0),
+            "trans_24h": f.transition_probs.get(24, 0.0),
+            "expected_hours": f.expected_transition_hours,
+            "crisis_approach_24h": f.crisis_approach_prob_24h,
+        })(_transition_forecaster.forecast()),
         "leading_indicators": {
             sym: {
                 "signal": r.signal.value,

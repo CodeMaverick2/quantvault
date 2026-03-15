@@ -1,6 +1,5 @@
 # QuantVault — Adaptive Multi-Signal Delta-Neutral Strategy
 
-> Ranger Build-A-Bear Hackathon submission
 > USDC vault targeting 15–30% APY via regime-adaptive delta-neutral funding capture
 
 ## Overview

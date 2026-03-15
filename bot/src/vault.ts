@@ -133,7 +133,13 @@ export class VaultManager {
     vaultAddress: string,
     apiBaseUrl: string = "https://api.voltr.xyz"
   ) {
-    this.vaultAddress = new PublicKey(vaultAddress);
+    if (!vaultAddress) {
+      logger.warn("VAULT_ADDRESS not configured — vault lending rebalances will be skipped");
+      // Use a placeholder public key; rebalanceToTargets will be a no-op when vaultAddress is empty
+      this.vaultAddress = new PublicKey("11111111111111111111111111111111");
+    } else {
+      this.vaultAddress = new PublicKey(vaultAddress);
+    }
 
     this.http = axios.create({
       baseURL: apiBaseUrl,
@@ -190,6 +196,11 @@ export class VaultManager {
    * @param targets  Map of strategyAddress → target fraction (0–1, must sum ≤ 1)
    */
   async rebalanceToTargets(targets: Record<string, number>): Promise<void> {
+    if (this.vaultAddress.toBase58() === "11111111111111111111111111111111") {
+      logger.debug("Skipping vault rebalance — VAULT_ADDRESS not configured");
+      return;
+    }
+
     const totalPct = Object.values(targets).reduce((s, v) => s + v, 0);
     if (totalPct > 1.001) {
       throw new Error(

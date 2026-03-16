@@ -902,7 +902,7 @@ async def send_report():
             # Use Resend API (HTTPS — works on all cloud platforms)
             import urllib.request as _urlreq, json as _json
             payload = _json.dumps({
-                "from": f"QuantVault <onboarding@resend.dev>",
+                "from": "QuantVault <onboarding@resend.dev>",
                 "to": [to_email],
                 "subject": f"QuantVault Report {ts}",
                 "html": html,
@@ -914,9 +914,14 @@ async def send_report():
                 headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
                 method="POST",
             )
-            with _urlreq.urlopen(req, timeout=15) as resp:
-                result = _json.loads(resp.read())
-            logger.info("Hourly report sent via Resend to %s (id=%s)", to_email, result.get("id"))
+            try:
+                with _urlreq.urlopen(req, timeout=15) as resp:
+                    result = _json.loads(resp.read())
+                logger.info("Hourly report sent via Resend to %s (id=%s)", to_email, result.get("id"))
+            except _urlreq.HTTPError as http_err:
+                body = http_err.read().decode("utf-8", errors="replace")
+                logger.error("Resend API error %s: %s", http_err.code, body)
+                raise RuntimeError(f"Resend {http_err.code}: {body}")
         else:
             # Fallback: SMTP
             with smtplib.SMTP("smtp.gmail.com", 587) as server:

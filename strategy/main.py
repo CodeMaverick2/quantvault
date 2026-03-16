@@ -868,12 +868,23 @@ async def send_report():
     to_email   = os.getenv("REPORT_EMAIL_TO")
     from_email = os.getenv("REPORT_EMAIL_FROM")
     email_pass = os.getenv("REPORT_EMAIL_PASS")
+    resend_key = os.getenv("RESEND_API_KEY")
 
-    if not all([to_email, from_email, email_pass]):
-        raise HTTPException(status_code=503, detail="Email env vars not configured (REPORT_EMAIL_TO / FROM / PASS)")
+    logger.info("=== /send-report called ===")
+    logger.info("REPORT_EMAIL_TO    : %s", to_email or "NOT SET")
+    logger.info("REPORT_EMAIL_FROM  : %s", from_email or "NOT SET")
+    logger.info("REPORT_EMAIL_PASS  : %s", "SET" if email_pass else "NOT SET")
+    logger.info("RESEND_API_KEY     : %s", "SET" if resend_key else "NOT SET")
 
+    if not to_email:
+        raise HTTPException(status_code=503, detail="REPORT_EMAIL_TO not set")
+    if not resend_key and not (from_email and email_pass):
+        raise HTTPException(status_code=503, detail="No email method configured — set RESEND_API_KEY or REPORT_EMAIL_FROM+PASS")
+
+    logger.info("Building report HTML...")
     try:
         html, text, ts = _build_report_html()
+        logger.info("Report built successfully for ts=%s", ts)
     except Exception as e:
         logger.exception("Report build failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Report build failed: {e}")
@@ -885,7 +896,7 @@ async def send_report():
     msg.attach(MIMEText(text, "plain"))
     msg.attach(MIMEText(html, "html"))
 
-    resend_key = os.getenv("RESEND_API_KEY")
+    logger.info("Sending email via %s...", "Resend API" if resend_key else "SMTP")
     try:
         if resend_key:
             # Use Resend API (HTTPS — works on all cloud platforms)

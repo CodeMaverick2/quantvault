@@ -3,7 +3,7 @@ FROM node:24-slim
 WORKDIR /app
 
 COPY bot/package*.json ./bot/
-RUN cd bot && npm install --omit=dev
+RUN cd bot && npm install --omit=dev --legacy-peer-deps
 
 COPY bot/ ./bot/
 RUN cd bot && npm run build

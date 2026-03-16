@@ -744,16 +744,21 @@ def _gemini_commentary(state_dict: dict) -> str:
         f"Rebalances completed: {state_dict['rebal_total']} | Error rate: {state_dict['error_rate']:.1f}%",
     ]
     prompt = (
-        "You are a DeFi fund manager explaining QuantVault's current status to a non-technical investor. "
-        "Given the data below, write exactly 3 sentences: "
-        "(1) what the vault is currently doing and earning, "
-        "(2) why it chose this allocation (regime + risk signals), "
-        "(3) one short risk note. Be specific with numbers. No markdown.\n\n"
+        "You are a DeFi fund manager writing a short hourly update for QuantVault, a delta-neutral yield vault on Solana. "
+        "The reader is a non-technical investor who wants to understand what their money is doing right now.\n\n"
+        "Write a clear, conversational update in 4-6 sentences covering:\n"
+        "- What the vault is doing right now and what yield it is targeting\n"
+        "- Why it made this allocation decision (mention the regime, risk signals, funding rates)\n"
+        "- Whether performance improved or declined vs last hour and why\n"
+        "- Any active risks or circuit breakers and what they mean in plain English\n"
+        "- A one-line outlook for the next hour based on current signals\n\n"
+        "Be specific with numbers. Write in plain English, no jargon, no markdown, no bullet points — just paragraphs.\n\n"
+        "Current data:\n"
         + "\n".join(lines)
     )
     payload = _json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 220, "temperature": 0.3},
+        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.4},
     }).encode()
     model = "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -764,10 +769,12 @@ def _gemini_commentary(state_dict: dict) -> str:
         method="POST",
     )
     try:
-        with _urlreq.urlopen(req, timeout=12) as resp:
+        with _urlreq.urlopen(req, timeout=15) as resp:
             data = _json.loads(resp.read())
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        logger.info("Gemini: commentary generated (%d chars)", len(text))
+        candidate = data["candidates"][0]
+        finish_reason = candidate.get("finishReason", "UNKNOWN")
+        text = candidate["content"]["parts"][0]["text"].strip()
+        logger.info("Gemini: commentary generated (%d chars, finishReason=%s)", len(text), finish_reason)
         return text
     except _urlreq.HTTPError as http_err:
         body = http_err.read().decode("utf-8", errors="replace")

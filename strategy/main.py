@@ -196,6 +196,10 @@ _hmm_lock = asyncio.Lock()
 _hmm_last_retrain_ts: float = 0.0
 HMM_RETRAIN_INTERVAL_SECS = 7 * 86400  # 1 week
 
+# Report analytics: NAV snapshots for hourly change tracking
+_engine_start_time: float = time.time()
+_report_nav_snapshots: collections.deque = collections.deque(maxlen=48)  # 48h of hourly history
+
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 
@@ -722,6 +726,52 @@ def _fetch_prometheus_metrics() -> dict:
     return result
 
 
+def _gemini_commentary(state_dict: dict) -> str:
+    """Call Gemini 1.5 Flash for a plain-English summary of current strategy state."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return ""
+    try:
+        import urllib.request as _urlreq, json as _json
+        lines = [
+            f"Vault NAV: ${state_dict['nav']:.2f} ({state_dict['nav_change_str']})",
+            f"Regime: {state_dict['regime']} at {state_dict['regime_conf']*100:.0f}% confidence",
+            f"Circuit Breaker: {state_dict['cb_state']}",
+            f"Expected APR: {state_dict['exp_apr']:.1f}%",
+            f"Position scale: {state_dict['pos_scale']:.2f}x (0=all cash, 1=full exposure)",
+            f"Allocation: {state_dict['k_pct']*100:.0f}% Kamino lending, {state_dict['d_pct']*100:.0f}% Drift spot, rest in perps",
+            f"Funding rates: {', '.join(f'{s}: {r*100:.2f}%' for s,r in state_dict['funding_rates'].items())}",
+            f"Rebalances completed: {state_dict['rebal_total']} | Error rate: {state_dict['error_rate']:.1f}%",
+        ]
+        prompt = (
+            "You are a DeFi fund manager explaining QuantVault's current status to a non-technical investor. "
+            "Given the data below, write exactly 3 sentences: "
+            "(1) what the vault is currently doing and earning, "
+            "(2) why it chose this allocation (regime + risk signals), "
+            "(3) one short risk note. Be specific with numbers. No markdown.\n\n"
+            + "\n".join(lines)
+        )
+        payload = _json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 220, "temperature": 0.3},
+        }).encode()
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-1.5-flash:generateContent?key={api_key}"
+        )
+        req = _urlreq.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "QuantVault/1.0"},
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=12) as resp:
+            data = _json.loads(resp.read())
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as exc:
+        logger.warning("Gemini commentary failed: %s", exc)
+        return ""
+
+
 def _build_report_html() -> tuple[str, str]:
     """Build HTML + plain-text report from current in-memory state."""
     now = datetime.datetime.utcnow()
@@ -741,16 +791,39 @@ def _build_report_html() -> tuple[str, str]:
     dd_scale = dd_state.position_scale if dd_state else 1.0
     pos_scale = circuit_breaker.get_position_multiplier() * dd_scale
 
-    # ── Market state (cascade_risk already stored by update-market) ───────────
+    # ── Market state ──────────────────────────────────────────────────────────
     funding_rates = {sym: s.get("funding_apr", 0) for sym, s in _market_state.items()}
     cascade_risks = {sym: float(s.get("cascade_risk", 0)) for sym, s in _market_state.items()}
 
-    # ── Prometheus (keeper bot metrics) ───────────────────────────────────────
+    # ── Prometheus ────────────────────────────────────────────────────────────
     prom = _fetch_prometheus_metrics()
-    nav_usd       = prom.get("quantvault_vault_nav_usd", _get_current_nav())
-    rebal_total   = int(prom.get("quantvault_rebalances_total", 0))
-    rebal_errors  = int(prom.get("quantvault_rebalance_errors_total", 0))
-    error_rate    = (rebal_errors / rebal_total * 100) if rebal_total > 0 else 0.0
+    nav_usd      = prom.get("quantvault_vault_nav_usd", _get_current_nav())
+    rebal_total  = int(prom.get("quantvault_rebalances_total", 0))
+    rebal_errors = int(prom.get("quantvault_rebalance_errors_total", 0))
+    error_rate   = (rebal_errors / rebal_total * 100) if rebal_total > 0 else 0.0
+
+    # ── NAV change vs last snapshot ───────────────────────────────────────────
+    nav_change_usd = 0.0
+    nav_change_pct = 0.0
+    if _report_nav_snapshots:
+        prev_nav = _report_nav_snapshots[-1][1]
+        if prev_nav > 0:
+            nav_change_usd = nav_usd - prev_nav
+            nav_change_pct = nav_change_usd / prev_nav * 100
+    _report_nav_snapshots.append((time.time(), nav_usd))
+
+    # Build change string: "+$2.10 (+1.2%)" or "-$0.50 (-0.3%)"
+    if nav_change_usd == 0.0 and not _report_nav_snapshots:
+        nav_change_str = "first report"
+    else:
+        sign = "+" if nav_change_usd >= 0 else ""
+        nav_change_str = f"{sign}${nav_change_usd:,.2f} ({sign}{nav_change_pct:.2f}%) vs last hour"
+
+    # ── Uptime ────────────────────────────────────────────────────────────────
+    uptime_secs = time.time() - _engine_start_time
+    uptime_h = int(uptime_secs // 3600)
+    uptime_m = int((uptime_secs % 3600) // 60)
+    uptime_str = f"{uptime_h}h {uptime_m}m"
 
     # ── Allocation snapshot ───────────────────────────────────────────────────
     try:
@@ -782,82 +855,173 @@ def _build_report_html() -> tuple[str, str]:
     except Exception:
         exp_apr, perp_allocs, k_pct, d_pct = 0.0, {}, 0.0, 0.0
 
-    # ── Status ────────────────────────────────────────────────────────────────
+    # ── Human-readable labels ─────────────────────────────────────────────────
     REGIME_EMOJI = {"BULL_CARRY": "🟢", "SIDEWAYS": "🟡", "HIGH_VOL_CRISIS": "🔴"}
-    r_emoji = REGIME_EMOJI.get(regime_name, "⚪")
+    REGIME_DESC  = {
+        "BULL_CARRY":      "Longs are paying shorts — good for collecting funding. Full perp exposure active.",
+        "SIDEWAYS":        "Funding rates are low or mixed. Mostly in lending, minimal perp exposure.",
+        "HIGH_VOL_CRISIS": "High volatility detected. Inverse carry mode — longing perps to collect negative funding.",
+        "UNKNOWN":         "Not enough data yet to classify regime. Staying in lending-only safe mode.",
+    }
+    CB_DESC = {
+        "NORMAL":       "All clear — no risk triggers.",
+        "WARNING":       "Minor signal triggered. Monitoring closely.",
+        "TRIGGERED":    "Risk event detected. All perp positions closed.",
+        "COOLING_DOWN": "Recovering after a risk event. Positions ramping back up gradually.",
+    }
+    SCALE_DESC = (
+        "Full exposure" if pos_scale >= 0.95
+        else f"Reduced to {pos_scale*100:.0f}% of normal size (risk management active)"
+        if pos_scale > 0
+        else "Zero exposure — all capital in safe lending"
+    )
+
     overall = ("✅ OPERATIONAL" if cb_state == "NORMAL" and not dd_halted
                else "⚠️ DEGRADED" if cb_state != "TRIGGERED" else "🔴 HALTED")
+    r_emoji = REGIME_EMOJI.get(regime_name, "⚪")
+    nav_color = "green" if nav_change_usd >= 0 else "red"
+    nav_arrow = "▲" if nav_change_usd > 0 else ("▼" if nav_change_usd < 0 else "—")
 
-    # ── Build HTML ────────────────────────────────────────────────────────────
+    # ── Gemini AI commentary ──────────────────────────────────────────────────
+    ai_commentary = _gemini_commentary({
+        "nav": nav_usd, "nav_change_str": nav_change_str,
+        "regime": regime_name, "regime_conf": regime_conf,
+        "cb_state": cb_state, "exp_apr": exp_apr,
+        "pos_scale": pos_scale, "k_pct": k_pct, "d_pct": d_pct,
+        "funding_rates": funding_rates, "rebal_total": rebal_total,
+        "error_rate": error_rate,
+    })
+    ai_block = (
+        f'<div class="card"><h2>🤖 AI Commentary</h2>'
+        f'<p style="font-size:14px;line-height:1.6;color:#d1d5db;margin:0">{ai_commentary}</p></div>'
+        if ai_commentary else ""
+    )
+
+    # ── Fund rows ─────────────────────────────────────────────────────────────
     fund_rows = "".join(
-        f"<tr><td>{sym}</td>"
-        f"<td class=\"{'green' if apr > 0.05 else 'yellow'}\">{apr*100:.2f}%</td>"
-        f"<td class=\"{'red' if cascade_risks.get(sym,0) > 0.7 else 'yellow' if cascade_risks.get(sym,0) > 0.5 else 'green'}\">{cascade_risks.get(sym,0):.2f}</td>"
-        f"<td>{perp_allocs.get(sym, 0)*100:.1f}%</td></tr>"
+        f"<tr>"
+        f"<td><b>{sym}</b></td>"
+        f"<td class=\"{'green' if apr > 0.05 else 'yellow' if apr >= 0 else 'red'}\">"
+        f"{apr*100:.2f}% {'(collecting)' if apr > 0.05 else '(low)' if apr >= 0 else '(negative!)'}</td>"
+        f"<td class=\"{'red' if cascade_risks.get(sym,0) > 0.7 else 'yellow' if cascade_risks.get(sym,0) > 0.5 else 'green'}\">"
+        f"{cascade_risks.get(sym,0):.2f} {'⚠' if cascade_risks.get(sym,0) > 0.5 else '✓'}</td>"
+        f"<td>{perp_allocs.get(sym,0)*100:.1f}%</td></tr>"
         for sym, apr in sorted(funding_rates.items(), key=lambda x: -x[1])
     )
-    alloc_bars = "".join(
-        f"<div class='signal-row'><span class='signal-label'>{sym} Perp</span>"
-        f"<span class='signal-value'>{pct*100:.1f}%</span></div>"
-        f"<div class='alloc-bar'><div class='alloc-fill' style='width:{pct*100:.1f}%'></div></div><br/>"
-        for sym, pct in perp_allocs.items()
-    )
 
-    html = f"""<!DOCTYPE html><html><head><style>
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"/><style>
 body{{font-family:-apple-system,Arial,sans-serif;background:#0a0a0f;color:#e0e0e0;margin:0;padding:0}}
-.container{{max-width:700px;margin:0 auto;padding:20px}}
-.header{{background:linear-gradient(135deg,#1a1a2e,#16213e);padding:24px;border-radius:12px;margin-bottom:20px;border:1px solid #2a2a4a}}
-.header h1{{margin:0;font-size:22px;color:#a78bfa}}.header .sub{{color:#6b7280;font-size:13px;margin-top:4px}}
-.card{{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px;margin-bottom:16px}}
-.card h2{{margin:0 0 14px 0;font-size:15px;color:#9ca3af;text-transform:uppercase;letter-spacing:.05em}}
-.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+.container{{max-width:680px;margin:0 auto;padding:20px}}
+.header{{background:linear-gradient(135deg,#1a1a2e,#16213e);padding:24px;border-radius:12px;margin-bottom:16px;border:1px solid #2a2a4a}}
+.header h1{{margin:0;font-size:22px;color:#a78bfa}}.header .sub{{color:#6b7280;font-size:13px;margin-top:6px}}
+.status-pill{{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600;
+  background:{'#14532d' if 'OPERATIONAL' in overall else '#7f1d1d'};
+  color:{'#4ade80' if 'OPERATIONAL' in overall else '#fca5a5'}}}
+.card{{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px;margin-bottom:14px}}
+.card h2{{margin:0 0 14px 0;font-size:13px;color:#9ca3af;text-transform:uppercase;letter-spacing:.06em}}
+.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
 .metric{{background:#0f172a;border-radius:8px;padding:12px}}
-.metric .label{{font-size:11px;color:#6b7280;margin-bottom:4px}}
-.metric .value{{font-size:20px;font-weight:bold;color:#f3f4f6}}
-.green{{color:#4ade80!important}}.yellow{{color:#fbbf24!important}}.red{{color:#f87171!important}}
-.signal-row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1f2937;font-size:13px}}
-.signal-row:last-child{{border-bottom:none}}.signal-label{{color:#9ca3af}}.signal-value{{color:#f3f4f6;font-weight:500}}
-.alloc-bar{{background:#1f2937;border-radius:4px;height:8px;margin-top:6px;overflow:hidden}}
+.metric .label{{font-size:11px;color:#6b7280;margin-bottom:3px;text-transform:uppercase}}
+.metric .value{{font-size:22px;font-weight:700;color:#f3f4f6}}
+.metric .sub{{font-size:11px;color:#6b7280;margin-top:3px}}
+.metric .change{{font-size:12px;margin-top:2px}}
+.green{{color:#4ade80!important}}.yellow{{color:#fbbf24!important}}.red{{color:#f87171!important}}.gray{{color:#6b7280!important}}
+.signal-row{{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #1f2937;font-size:13px}}
+.signal-row:last-child{{border-bottom:none}}
+.signal-label{{color:#9ca3af;min-width:140px}}.signal-value{{color:#f3f4f6;font-weight:500;text-align:right}}
+.signal-desc{{color:#6b7280;font-size:11px;margin-top:2px}}
+.alloc-bar{{background:#1f2937;border-radius:4px;height:6px;margin-top:4px;overflow:hidden}}
 .alloc-fill{{height:100%;border-radius:4px;background:linear-gradient(90deg,#7c3aed,#a78bfa)}}
 table{{width:100%;border-collapse:collapse;font-size:13px}}
-th{{text-align:left;color:#6b7280;font-weight:normal;padding:6px 8px;border-bottom:1px solid #1f2937}}
-td{{padding:8px;border-bottom:1px solid #111827}}
+th{{text-align:left;color:#6b7280;font-weight:500;padding:7px 8px;border-bottom:1px solid #1f2937;font-size:11px;text-transform:uppercase}}
+td{{padding:9px 8px;border-bottom:1px solid #0f172a;vertical-align:top}}
+.hint{{color:#6b7280;font-size:11px;margin-top:12px;padding:10px;background:#0f172a;border-radius:6px;line-height:1.5}}
 .footer{{text-align:center;color:#4b5563;font-size:11px;padding:16px}}
 </style></head><body><div class="container">
-<div class="header"><h1>⚡ QuantVault System Report</h1>
-<div class="sub">{ts} &nbsp;|&nbsp; {overall}</div></div>
-<div class="card"><h2>Portfolio Overview</h2><div class="metric-grid">
-<div class="metric"><div class="label">VAULT NAV</div><div class="value green">${nav_usd:,.2f}</div></div>
-<div class="metric"><div class="label">EXPECTED APR</div><div class="value {'green' if exp_apr >= 10 else 'yellow'}">{exp_apr:.1f}%</div></div>
-<div class="metric"><div class="label">REBALANCES</div><div class="value">{rebal_total}</div><div style="font-size:11px;color:#6b7280">Error rate: {error_rate:.1f}%</div></div>
-<div class="metric"><div class="label">CIRCUIT BREAKER</div><div class="value {'green' if cb_state=='NORMAL' else 'red'}">{cb_state}</div></div>
-</div></div>
-<div class="card"><h2>Market Regime</h2>
-<div class="signal-row"><span class="signal-label">Active Regime</span><span class="signal-value">{r_emoji} {regime_name} ({regime_conf*100:.0f}%)</span></div>
-<div class="signal-row"><span class="signal-label">Position Scale</span><span class="signal-value">{pos_scale:.2f}x</span></div>
-{"".join(f'<div class="signal-row"><span class="signal-label">P({r})</span><span class="signal-value">{v*100:.1f}%</span></div>' for r,v in regime_probs.items())}
+
+<div class="header">
+  <h1>⚡ QuantVault Hourly Report</h1>
+  <div class="sub">{ts} &nbsp;·&nbsp; Uptime: {uptime_str} &nbsp;·&nbsp; <span class="status-pill">{overall}</span></div>
 </div>
-<div class="card"><h2>Live Funding Rates</h2>
-<table><tr><th>Market</th><th>Funding APR</th><th>Cascade Risk</th><th>Target Alloc</th></tr>
-{fund_rows}</table></div>
-<div class="card"><h2>Current Allocation</h2>
-<div class="signal-row"><span class="signal-label">Kamino Lending</span><span class="signal-value">{k_pct*100:.1f}%</span></div>
-<div class="alloc-bar"><div class="alloc-fill" style="width:{k_pct*100:.1f}%"></div></div><br/>
-<div class="signal-row"><span class="signal-label">Drift Spot Lending</span><span class="signal-value">{d_pct*100:.1f}%</span></div>
-<div class="alloc-bar"><div class="alloc-fill" style="width:{d_pct*100:.1f}%"></div></div><br/>
-{alloc_bars}</div>
-<div class="footer">QuantVault Keeper Bot &nbsp;|&nbsp; Generated {ts}<br/>Next report in ~1 hour</div>
+
+<div class="card"><h2>Portfolio Summary</h2>
+<div class="metric-grid">
+<div class="metric">
+  <div class="label">Vault Balance</div>
+  <div class="value green">${nav_usd:,.2f}</div>
+  <div class="change {nav_color}">{nav_arrow} {nav_change_str}</div>
+</div>
+<div class="metric">
+  <div class="label">Expected Annual Yield</div>
+  <div class="value {'green' if exp_apr >= 10 else 'yellow'}">{exp_apr:.1f}%</div>
+  <div class="sub">Blended across all positions</div>
+</div>
+<div class="metric">
+  <div class="label">Rebalances Done</div>
+  <div class="value">{rebal_total}</div>
+  <div class="sub">Error rate: {error_rate:.1f}%</div>
+</div>
+<div class="metric">
+  <div class="label">Risk System</div>
+  <div class="value {'green' if cb_state=='NORMAL' else 'yellow' if cb_state=='COOLING_DOWN' else 'red'}">{cb_state}</div>
+  <div class="sub">{CB_DESC.get(cb_state, '')}</div>
+</div>
+</div></div>
+
+{ai_block}
+
+<div class="card"><h2>Market Regime</h2>
+<div class="signal-row">
+  <div><span class="signal-label">Current Regime</span><div class="signal-desc">{REGIME_DESC.get(regime_name,'')}</div></div>
+  <span class="signal-value">{r_emoji} {regime_name}<br/><span class="gray" style="font-size:11px">{regime_conf*100:.0f}% confident</span></span>
+</div>
+<div class="signal-row">
+  <div><span class="signal-label">Position Sizing</span><div class="signal-desc">{SCALE_DESC}</div></div>
+  <span class="signal-value">{'<span class="green">'+f"{pos_scale:.2f}x"+'</span>' if pos_scale >= 0.9 else '<span class="yellow">'+f"{pos_scale:.2f}x"+'</span>' if pos_scale > 0 else '<span class="red">0.00x</span>'}</span>
+</div>
+{"".join(f'<div class="signal-row"><span class="signal-label">Probability {r}</span><span class="signal-value">{v*100:.1f}%</span></div>' for r,v in sorted(regime_probs.items(), key=lambda x:-x[1]))}
+</div>
+
+<div class="card"><h2>Funding Rates (What We Earn)</h2>
+<table>
+  <tr><th>Market</th><th>Funding APR</th><th>Risk Score</th><th>Our Allocation</th></tr>
+  {fund_rows}
+</table>
+<div class="hint">💡 <b>Funding APR</b> is the annualized rate shorts earn from longs. Above 5% = we open a position. Risk Score above 0.5 = we reduce or avoid the position.</div>
+</div>
+
+<div class="card"><h2>Where Your Money Is</h2>
+<div class="signal-row"><span class="signal-label">Kamino Lending (~5% APY)</span><span class="signal-value">{k_pct*100:.1f}%</span></div>
+<div class="alloc-bar"><div class="alloc-fill" style="width:{min(k_pct*100,100):.1f}%"></div></div>
+<div style="margin-bottom:12px"></div>
+<div class="signal-row"><span class="signal-label">Drift Spot Lending (~5% APY)</span><span class="signal-value">{d_pct*100:.1f}%</span></div>
+<div class="alloc-bar"><div class="alloc-fill" style="width:{min(d_pct*100,100):.1f}%"></div></div>
+<div style="margin-bottom:12px"></div>
+{"".join(f'<div class="signal-row"><span class="signal-label">{sym} Perp Short</span><span class="signal-value">{pct*100:.1f}%</span></div><div class="alloc-bar"><div class="alloc-fill" style="width:{min(pct*100,100):.1f}%"></div></div><div style="margin-bottom:12px"></div>' for sym, pct in perp_allocs.items() if pct > 0)}
+<div class="hint">💡 Lending earns a fixed ~5% APY and is always on. Perp shorts earn the funding rate on top — but only when signals are aligned.</div>
+</div>
+
+<div class="footer">QuantVault Strategy Engine &nbsp;·&nbsp; {ts}<br/>Next report in ~1 hour &nbsp;·&nbsp; Reply to this email to get help</div>
 </div></body></html>"""
 
-    text = (f"QuantVault Report — {ts}\n\nSTATUS: {overall}\n"
-            f"NAV: ${nav_usd:,.2f} | APR: {exp_apr:.1f}%\n"
-            f"Regime: {regime_name} ({regime_conf*100:.0f}%) | Scale: {pos_scale:.2f}x\n"
-            f"CB: {cb_state} | DD Halt: {dd_halted}\n"
-            f"Rebalances: {rebal_total} | Error rate: {error_rate:.1f}%\n\n"
-            f"FUNDING:\n" +
-            "\n".join(f"  {sym}: {apr*100:.2f}% APR" for sym, apr in funding_rates.items()) +
-            f"\n\nALLOCATION:\n  Kamino: {k_pct*100:.1f}%  Drift Spot: {d_pct*100:.1f}%\n" +
-            "\n".join(f"  {sym}: {pct*100:.1f}%" for sym, pct in perp_allocs.items()))
+    text = (
+        f"QuantVault Hourly Report — {ts}\n"
+        f"{'='*50}\n"
+        f"STATUS: {overall}\n"
+        f"NAV: ${nav_usd:,.2f}  ({nav_change_str})\n"
+        f"Expected APR: {exp_apr:.1f}%  |  Uptime: {uptime_str}\n\n"
+        f"REGIME: {regime_name} ({regime_conf*100:.0f}% confident)\n"
+        f"  {REGIME_DESC.get(regime_name, '')}\n\n"
+        f"RISK: {cb_state} — {CB_DESC.get(cb_state, '')}\n"
+        f"Position sizing: {SCALE_DESC}\n\n"
+        f"FUNDING RATES:\n"
+        + "\n".join(f"  {sym}: {apr*100:.2f}% APR  (cascade risk: {cascade_risks.get(sym,0):.2f})" for sym, apr in sorted(funding_rates.items(), key=lambda x: -x[1]))
+        + f"\n\nALLOCATION:\n"
+        f"  Kamino Lending: {k_pct*100:.1f}%\n"
+        f"  Drift Spot Lending: {d_pct*100:.1f}%\n"
+        + "\n".join(f"  {sym} Perp: {pct*100:.1f}%" for sym, pct in perp_allocs.items())
+        + f"\n\nRebalances: {rebal_total}  |  Error rate: {error_rate:.1f}%\n"
+    )
 
     return html, text, ts
 

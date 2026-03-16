@@ -727,48 +727,54 @@ def _fetch_prometheus_metrics() -> dict:
 
 
 def _gemini_commentary(state_dict: dict) -> str:
-    """Call Gemini 1.5 Flash for a plain-English summary of current strategy state."""
+    """Call Gemini 2.0 Flash for a plain-English summary of current strategy state."""
     api_key = os.getenv("GEMINI_API_KEY")
+    logger.info("Gemini: API key %s", "SET" if api_key else "NOT SET — skipping commentary")
     if not api_key:
         return ""
+    import urllib.request as _urlreq, json as _json
+    lines = [
+        f"Vault NAV: ${state_dict['nav']:.2f} ({state_dict['nav_change_str']})",
+        f"Regime: {state_dict['regime']} at {state_dict['regime_conf']*100:.0f}% confidence",
+        f"Circuit Breaker: {state_dict['cb_state']}",
+        f"Expected APR: {state_dict['exp_apr']:.1f}%",
+        f"Position scale: {state_dict['pos_scale']:.2f}x (0=all cash, 1=full exposure)",
+        f"Allocation: {state_dict['k_pct']*100:.0f}% Kamino lending, {state_dict['d_pct']*100:.0f}% Drift spot, rest in perps",
+        f"Funding rates: {', '.join(f'{s}: {r*100:.2f}%' for s,r in state_dict['funding_rates'].items())}",
+        f"Rebalances completed: {state_dict['rebal_total']} | Error rate: {state_dict['error_rate']:.1f}%",
+    ]
+    prompt = (
+        "You are a DeFi fund manager explaining QuantVault's current status to a non-technical investor. "
+        "Given the data below, write exactly 3 sentences: "
+        "(1) what the vault is currently doing and earning, "
+        "(2) why it chose this allocation (regime + risk signals), "
+        "(3) one short risk note. Be specific with numbers. No markdown.\n\n"
+        + "\n".join(lines)
+    )
+    payload = _json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 220, "temperature": 0.3},
+    }).encode()
+    model = "gemini-2.0-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    logger.info("Gemini: calling model=%s", model)
+    req = _urlreq.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "QuantVault/1.0"},
+        method="POST",
+    )
     try:
-        import urllib.request as _urlreq, json as _json
-        lines = [
-            f"Vault NAV: ${state_dict['nav']:.2f} ({state_dict['nav_change_str']})",
-            f"Regime: {state_dict['regime']} at {state_dict['regime_conf']*100:.0f}% confidence",
-            f"Circuit Breaker: {state_dict['cb_state']}",
-            f"Expected APR: {state_dict['exp_apr']:.1f}%",
-            f"Position scale: {state_dict['pos_scale']:.2f}x (0=all cash, 1=full exposure)",
-            f"Allocation: {state_dict['k_pct']*100:.0f}% Kamino lending, {state_dict['d_pct']*100:.0f}% Drift spot, rest in perps",
-            f"Funding rates: {', '.join(f'{s}: {r*100:.2f}%' for s,r in state_dict['funding_rates'].items())}",
-            f"Rebalances completed: {state_dict['rebal_total']} | Error rate: {state_dict['error_rate']:.1f}%",
-        ]
-        prompt = (
-            "You are a DeFi fund manager explaining QuantVault's current status to a non-technical investor. "
-            "Given the data below, write exactly 3 sentences: "
-            "(1) what the vault is currently doing and earning, "
-            "(2) why it chose this allocation (regime + risk signals), "
-            "(3) one short risk note. Be specific with numbers. No markdown.\n\n"
-            + "\n".join(lines)
-        )
-        payload = _json.dumps({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 220, "temperature": 0.3},
-        }).encode()
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-1.5-flash:generateContent?key={api_key}"
-        )
-        req = _urlreq.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "QuantVault/1.0"},
-            method="POST",
-        )
         with _urlreq.urlopen(req, timeout=12) as resp:
             data = _json.loads(resp.read())
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        logger.info("Gemini: commentary generated (%d chars)", len(text))
+        return text
+    except _urlreq.HTTPError as http_err:
+        body = http_err.read().decode("utf-8", errors="replace")
+        logger.error("Gemini HTTP %s: %s", http_err.code, body)
+        return ""
     except Exception as exc:
-        logger.warning("Gemini commentary failed: %s", exc)
+        logger.error("Gemini unexpected error: %s", exc)
         return ""
 
 

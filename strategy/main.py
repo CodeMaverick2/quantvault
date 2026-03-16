@@ -694,6 +694,206 @@ def _get_current_nav() -> float:
     return 0.0
 
 
+# ── Email report endpoint ─────────────────────────────────────────────────────
+
+import smtplib
+import datetime
+import urllib.request
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+def _fetch_prometheus_metrics() -> dict:
+    """Fetch Prometheus metrics from keeper-bot container."""
+    metrics_url = os.getenv("KEEPER_METRICS_URL", "http://localhost:9090")
+    result = {}
+    try:
+        with urllib.request.urlopen(f"{metrics_url}/metrics", timeout=5) as resp:
+            for line in resp.read().decode().splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        result[parts[0]] = float(parts[-1])
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning("Could not fetch Prometheus metrics: %s", e)
+    return result
+
+
+def _build_report_html() -> tuple[str, str]:
+    """Build HTML + plain-text report from current in-memory state."""
+    now = datetime.datetime.utcnow()
+    ts = now.strftime("%Y-%m-%d %H:%M UTC")
+
+    # ── Regime ────────────────────────────────────────────────────────────────
+    if _latest_regime:
+        regime_name = _latest_regime.regime.name
+        regime_conf = _latest_regime.confidence
+        regime_probs = {s.name: p for s, p in (_latest_regime.probabilities or {}).items()}
+    else:
+        regime_name, regime_conf, regime_probs = "UNKNOWN", 0.0, {}
+
+    cb_state = circuit_breaker.state.value
+    dd_halted = drawdown_ctrl.is_halted
+    pos_scale = circuit_breaker.get_position_multiplier() * drawdown_ctrl.get_scale()
+
+    # ── Market state ──────────────────────────────────────────────────────────
+    funding_rates = {sym: s.get("funding_apr", 0) for sym, s in _market_state.items()}
+    cascade_risks = {sym: float(_cascade_scorer.get_score(sym)) for sym in _market_state}
+
+    # ── Prometheus (keeper bot metrics) ───────────────────────────────────────
+    prom = _fetch_prometheus_metrics()
+    nav_usd       = prom.get("quantvault_vault_nav_usd", _get_current_nav())
+    rebal_total   = int(prom.get("quantvault_rebalances_total", 0))
+    rebal_errors  = int(prom.get("quantvault_rebalance_errors_total", 0))
+    error_rate    = (rebal_errors / rebal_total * 100) if rebal_total > 0 else 0.0
+
+    # ── Allocation snapshot ───────────────────────────────────────────────────
+    try:
+        alloc_result = _allocation_optimizer.compute(
+            markets=[
+                MarketYieldData(
+                    symbol=sym,
+                    funding_apr=s.get("funding_apr", 0),
+                    lending_apr=s.get("lending_apr", 0),
+                    is_perp=True,
+                    cascade_risk=float(_cascade_scorer.get_score(sym)),
+                    persistence_score=_persistence_scorer.get_score(sym),
+                    consecutive_positive=_persistence_scorer.get_consecutive_positive(sym),
+                )
+                for sym, s in _market_state.items()
+            ],
+            regime=_latest_regime.regime if _latest_regime else __import__("strategy.models.hmm_regime", fromlist=["MarketRegime"]).MarketRegime.SIDEWAYS,
+            regime_confidence=regime_conf,
+            drawdown_scale=drawdown_ctrl.get_scale(),
+            cb_scale=circuit_breaker.get_position_multiplier(),
+            kamino_apr=5.0,
+            drift_spot_apr=5.0,
+        )
+        exp_apr     = alloc_result.expected_blended_apr
+        perp_allocs = alloc_result.perp_allocations
+        k_pct       = alloc_result.kamino_lending_pct
+        d_pct       = alloc_result.drift_spot_lending_pct
+    except Exception:
+        exp_apr, perp_allocs, k_pct, d_pct = 0.0, {}, 0.0, 0.0
+
+    # ── Status ────────────────────────────────────────────────────────────────
+    REGIME_EMOJI = {"BULL_CARRY": "🟢", "SIDEWAYS": "🟡", "HIGH_VOL_CRISIS": "🔴"}
+    r_emoji = REGIME_EMOJI.get(regime_name, "⚪")
+    overall = ("✅ OPERATIONAL" if cb_state == "NORMAL" and not dd_halted
+               else "⚠️ DEGRADED" if cb_state != "TRIGGERED" else "🔴 HALTED")
+
+    # ── Build HTML ────────────────────────────────────────────────────────────
+    fund_rows = "".join(
+        f"<tr><td>{sym}</td>"
+        f"<td class=\"{'green' if apr > 0.05 else 'yellow'}\">{apr*100:.2f}%</td>"
+        f"<td class=\"{'red' if cascade_risks.get(sym,0) > 0.7 else 'yellow' if cascade_risks.get(sym,0) > 0.5 else 'green'}\">{cascade_risks.get(sym,0):.2f}</td>"
+        f"<td>{perp_allocs.get(sym, 0)*100:.1f}%</td></tr>"
+        for sym, apr in sorted(funding_rates.items(), key=lambda x: -x[1])
+    )
+    alloc_bars = "".join(
+        f"<div class='signal-row'><span class='signal-label'>{sym} Perp</span>"
+        f"<span class='signal-value'>{pct*100:.1f}%</span></div>"
+        f"<div class='alloc-bar'><div class='alloc-fill' style='width:{pct*100:.1f}%'></div></div><br/>"
+        for sym, pct in perp_allocs.items()
+    )
+
+    html = f"""<!DOCTYPE html><html><head><style>
+body{{font-family:-apple-system,Arial,sans-serif;background:#0a0a0f;color:#e0e0e0;margin:0;padding:0}}
+.container{{max-width:700px;margin:0 auto;padding:20px}}
+.header{{background:linear-gradient(135deg,#1a1a2e,#16213e);padding:24px;border-radius:12px;margin-bottom:20px;border:1px solid #2a2a4a}}
+.header h1{{margin:0;font-size:22px;color:#a78bfa}}.header .sub{{color:#6b7280;font-size:13px;margin-top:4px}}
+.card{{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px;margin-bottom:16px}}
+.card h2{{margin:0 0 14px 0;font-size:15px;color:#9ca3af;text-transform:uppercase;letter-spacing:.05em}}
+.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+.metric{{background:#0f172a;border-radius:8px;padding:12px}}
+.metric .label{{font-size:11px;color:#6b7280;margin-bottom:4px}}
+.metric .value{{font-size:20px;font-weight:bold;color:#f3f4f6}}
+.green{{color:#4ade80!important}}.yellow{{color:#fbbf24!important}}.red{{color:#f87171!important}}
+.signal-row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1f2937;font-size:13px}}
+.signal-row:last-child{{border-bottom:none}}.signal-label{{color:#9ca3af}}.signal-value{{color:#f3f4f6;font-weight:500}}
+.alloc-bar{{background:#1f2937;border-radius:4px;height:8px;margin-top:6px;overflow:hidden}}
+.alloc-fill{{height:100%;border-radius:4px;background:linear-gradient(90deg,#7c3aed,#a78bfa)}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th{{text-align:left;color:#6b7280;font-weight:normal;padding:6px 8px;border-bottom:1px solid #1f2937}}
+td{{padding:8px;border-bottom:1px solid #111827}}
+.footer{{text-align:center;color:#4b5563;font-size:11px;padding:16px}}
+</style></head><body><div class="container">
+<div class="header"><h1>⚡ QuantVault System Report</h1>
+<div class="sub">{ts} &nbsp;|&nbsp; {overall}</div></div>
+<div class="card"><h2>Portfolio Overview</h2><div class="metric-grid">
+<div class="metric"><div class="label">VAULT NAV</div><div class="value green">${nav_usd:,.2f}</div></div>
+<div class="metric"><div class="label">EXPECTED APR</div><div class="value {'green' if exp_apr >= 10 else 'yellow'}">{exp_apr:.1f}%</div></div>
+<div class="metric"><div class="label">REBALANCES</div><div class="value">{rebal_total}</div><div style="font-size:11px;color:#6b7280">Error rate: {error_rate:.1f}%</div></div>
+<div class="metric"><div class="label">CIRCUIT BREAKER</div><div class="value {'green' if cb_state=='NORMAL' else 'red'}">{cb_state}</div></div>
+</div></div>
+<div class="card"><h2>Market Regime</h2>
+<div class="signal-row"><span class="signal-label">Active Regime</span><span class="signal-value">{r_emoji} {regime_name} ({regime_conf*100:.0f}%)</span></div>
+<div class="signal-row"><span class="signal-label">Position Scale</span><span class="signal-value">{pos_scale:.2f}x</span></div>
+{"".join(f'<div class="signal-row"><span class="signal-label">P({r})</span><span class="signal-value">{v*100:.1f}%</span></div>' for r,v in regime_probs.items())}
+</div>
+<div class="card"><h2>Live Funding Rates</h2>
+<table><tr><th>Market</th><th>Funding APR</th><th>Cascade Risk</th><th>Target Alloc</th></tr>
+{fund_rows}</table></div>
+<div class="card"><h2>Current Allocation</h2>
+<div class="signal-row"><span class="signal-label">Kamino Lending</span><span class="signal-value">{k_pct*100:.1f}%</span></div>
+<div class="alloc-bar"><div class="alloc-fill" style="width:{k_pct*100:.1f}%"></div></div><br/>
+<div class="signal-row"><span class="signal-label">Drift Spot Lending</span><span class="signal-value">{d_pct*100:.1f}%</span></div>
+<div class="alloc-bar"><div class="alloc-fill" style="width:{d_pct*100:.1f}%"></div></div><br/>
+{alloc_bars}</div>
+<div class="footer">QuantVault Keeper Bot &nbsp;|&nbsp; Generated {ts}<br/>Next report in ~1 hour</div>
+</div></body></html>"""
+
+    text = (f"QuantVault Report — {ts}\n\nSTATUS: {overall}\n"
+            f"NAV: ${nav_usd:,.2f} | APR: {exp_apr:.1f}%\n"
+            f"Regime: {regime_name} ({regime_conf*100:.0f}%) | Scale: {pos_scale:.2f}x\n"
+            f"CB: {cb_state} | DD Halt: {dd_halted}\n"
+            f"Rebalances: {rebal_total} | Error rate: {error_rate:.1f}%\n\n"
+            f"FUNDING:\n" +
+            "\n".join(f"  {sym}: {apr*100:.2f}% APR" for sym, apr in funding_rates.items()) +
+            f"\n\nALLOCATION:\n  Kamino: {k_pct*100:.1f}%  Drift Spot: {d_pct*100:.1f}%\n" +
+            "\n".join(f"  {sym}: {pct*100:.1f}%" for sym, pct in perp_allocs.items()))
+
+    return html, text, ts
+
+
+@app.post("/send-report")
+async def send_report():
+    """Build and email the hourly performance report. Called by cron-job.org."""
+    to_email   = os.getenv("REPORT_EMAIL_TO")
+    from_email = os.getenv("REPORT_EMAIL_FROM")
+    email_pass = os.getenv("REPORT_EMAIL_PASS")
+
+    if not all([to_email, from_email, email_pass]):
+        raise HTTPException(status_code=503, detail="Email env vars not configured (REPORT_EMAIL_TO / FROM / PASS)")
+
+    try:
+        html, text, ts = _build_report_html()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Report build failed: {e}")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"QuantVault Report {ts}"
+    msg["From"]    = from_email
+    msg["To"]      = to_email
+    msg.attach(MIMEText(text, "plain"))
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(from_email, email_pass)
+            server.sendmail(from_email, to_email, msg.as_string())
+        logger.info("Hourly report sent to %s", to_email)
+        return {"status": "ok", "sent_to": to_email, "ts": ts}
+    except Exception as e:
+        logger.error("Failed to send report email: %s", e)
+        raise HTTPException(status_code=500, detail=f"SMTP error: {e}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(

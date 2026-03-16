@@ -195,10 +195,9 @@ _leading_engine = LeadingIndicatorEngine()        # OI + basis + liquidation lea
 
 # Stat arb: Johansen cointegration across correlated perp pairs
 _cointegration_engine = CointegrationEngine(
-    entry_z_score=CFG["cointegration"]["entry_z_score"],
-    exit_z_score=CFG["cointegration"]["exit_z_score"],
-    stop_loss_z_score=CFG["cointegration"]["stop_loss_z_score"],
-    max_allocation_pct=CFG["cointegration"]["max_allocation_pct"],
+    entry_z=CFG["cointegration"]["entry_z_score"],
+    exit_z=CFG["cointegration"]["exit_z_score"],
+    stop_z=CFG["cointegration"]["stop_loss_z_score"],
 )
 _stat_arb_signals: dict[str, object] = {}   # latest signals keyed by pair
 

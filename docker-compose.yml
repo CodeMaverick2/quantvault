@@ -11,6 +11,13 @@ services:
     environment:
       - PORT=8000
       - LOG_LEVEL=info
+      # Circuit breaker tuning (override for devnet: ORACLE_SIGMA_THRESHOLD=8.0)
+      - ORACLE_SIGMA_THRESHOLD=${ORACLE_SIGMA_THRESHOLD:-5.0}
+      - CB_COOLDOWN_SECS=${CB_COOLDOWN_SECS:-1800}
+      - ORACLE_MOVE_WINDOW=${ORACLE_MOVE_WINDOW:-20}
+      # Allocation tuning
+      - MIN_FUNDING_APR_THRESHOLD=${MIN_FUNDING_APR_THRESHOLD:-8.0}
+      - PREDICTIVE_EXIT_QUORUM=${PREDICTIVE_EXIT_QUORUM:-3}
     volumes:
       - ./models:/app/models
       - ./data:/app/data

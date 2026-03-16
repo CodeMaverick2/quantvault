@@ -135,12 +135,13 @@ deployed to a perp position.
 | Oracle deviation | > 0.5% from CEX | Emergency exit |
 | Cascade risk score | > 0.70 | 50% scale reduction + cooldown |
 | Liquidity collapse | book depth < 30% avg | Emergency exit |
-| **Oracle manipulation** | > 3σ price move in 1 slot | **Full halt** |
+| **Oracle manipulation** | > 5σ price move in 1 slot | **Full halt** |
 
 The oracle manipulation defense is modeled on the **Mango Markets exploit** — the most
-dangerous failure mode on Solana. We maintain a rolling 10-slot oracle price history per
-symbol and flag any single-update move exceeding 3 standard deviations. This is
-non-negotiable and distinguishes production-grade systems from hackathon demos.
+dangerous failure mode on Solana. We maintain a rolling 20-slot oracle price history per
+symbol and flag any single-update move exceeding 5 standard deviations. Threshold and
+cooldown period are configurable via env vars (`ORACLE_SIGMA_THRESHOLD`, `CB_COOLDOWN_SECS`)
+allowing tighter protection on mainnet vs. devnet's noisier feeds.
 
 ### Drawdown Controller
 | Drawdown | Action |
@@ -247,3 +248,73 @@ this same period would yield ~11.8% APY instead of 4.8% — the most impactful i
 | `GET /risk` | Circuit breaker events, drawdown state, cascade scores |
 | `POST /update-market` | Push market data (funding, OI, depth, oracle price) |
 | `POST /record-nav` | Record NAV for drawdown tracking |
+
+---
+
+## Mainnet Deployment
+
+### Prerequisites
+- SOL for transaction fees (~0.5 SOL minimum)
+- USDC for vault seeding (minimum $100 for meaningful yield data)
+- Helius or Triton RPC endpoint (public RPCs rate-limit on mainnet)
+
+### Step 1 — Initialize vault on-chain
+```bash
+CLUSTER=mainnet-beta \
+RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY \
+KEEPER_PRIVATE_KEY='[...]' \
+npx ts-node scripts/init_vault.ts
+```
+This creates the Voltr vault on-chain (USDC base asset) and writes the vault address to `config/vault_addresses.json`.
+
+### Step 2 — Register lending adaptors
+```bash
+CLUSTER=mainnet-beta \
+RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY \
+KEEPER_PRIVATE_KEY='[...]' \
+npx ts-node scripts/add_strategies.ts
+```
+Registers Kamino Lending and Drift Spot lending strategy addresses on the vault.
+
+### Step 3 — Configure env vars for Railway
+```
+CLUSTER=mainnet-beta
+RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+KEEPER_PRIVATE_KEY=[...]
+VAULT_ADDRESS=<from step 1>
+LOG_LEVEL=info
+METRICS_PORT=9090
+STRATEGY_ENGINE_URL=http://<strategy-engine-internal-host>:8000
+
+# Mainnet-tuned thresholds
+ORACLE_SIGMA_THRESHOLD=5.0
+CB_COOLDOWN_SECS=1800
+MIN_FUNDING_APR_THRESHOLD=8.0
+PREDICTIVE_EXIT_QUORUM=3
+```
+
+### Step 4 — Deposit USDC into the vault
+Use the Ranger Earn UI or Voltr SDK to deposit USDC. The keeper bot will automatically allocate to lending strategies and begin earning yield on the next rebalance cycle.
+
+### On-chain Verification
+- **Vault address**: visible on Solscan after Step 1 init tx
+- **Keeper wallet**: `BPrSjs3XtA8qL2TrBB2LHq4EWzx7qtVjAjKRkErcqifj`
+- **Trade activity**: each rebalance produces on-chain transactions — viewable at `solscan.io/account/<vault_address>`
+- **Performance**: Prometheus metrics at `:9090/metrics` — `quantvault_vault_nav_usd`, `quantvault_expected_apr`
+
+---
+
+## Environment Variables Reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLUSTER` | `devnet` | `devnet` or `mainnet-beta` |
+| `RPC_URL` | public devnet | Solana RPC endpoint |
+| `KEEPER_PRIVATE_KEY` | — | Keeper wallet JSON array |
+| `VAULT_ADDRESS` | — | Voltr vault public key |
+| `ORACLE_SIGMA_THRESHOLD` | `5.0` | σ threshold for oracle manipulation detection |
+| `CB_COOLDOWN_SECS` | `1800` | Circuit breaker cooldown in seconds |
+| `MIN_FUNDING_APR_THRESHOLD` | `8.0` | Min funding APR (%) before opening perp positions |
+| `PREDICTIVE_EXIT_QUORUM` | `3` | Number of symbols that must signal exit to apply 0.3× reduction |
+| `LOG_LEVEL` | `info` | Logging verbosity |
+| `METRICS_PORT` | `9090` | Prometheus metrics port |

@@ -19,6 +19,7 @@ Key improvements over naive delta-neutral:
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -93,13 +94,17 @@ class AllocationConfig:
     max_perp_pct: float = 0.60
     max_single_perp_pct: float = 0.25
     max_stat_arb_pct: float = 0.15
-    target_funding_apr_threshold: float = 10.0  # % APR minimum to enter perp
+    # Env-configurable: lower on mainnet when funding is reliable; raise on devnet noise
+    target_funding_apr_threshold: float = float(os.getenv("MIN_FUNDING_APR_THRESHOLD", "8.0"))
     min_persistence_score: float = 0.55          # gate: minimum entry quality
     min_consecutive_positive: int = 3            # gate: minimum consecutive positive hours
     target_vol: float = 0.15                     # target portfolio vol for vol-targeting
     cascade_risk_entry_gate: float = 0.50        # max cascade risk to allow entry
     inverse_carry_threshold: float = 5.0         # |funding_apr| must exceed this for inverse carry
     min_inverse_carry_net_apr: float = 3.0       # min net APR after borrow cost to enter
+    # How many symbols must signal exit before applying 0.3x scale reduction
+    # Set to 3 to require unanimous exit signal (prevents premature scale reduction)
+    predictive_exit_quorum: int = int(os.getenv("PREDICTIVE_EXIT_QUORUM", "3"))
 
 
 class DynamicAllocationOptimizer:
@@ -240,8 +245,8 @@ class DynamicAllocationOptimizer:
                 if f.exit_signal
             )
 
-            if exit_signal_count >= 2:
-                # Majority of symbols say "exit" → reduce hard
+            if exit_signal_count >= self.config.predictive_exit_quorum:
+                # All symbols say "exit" → reduce hard
                 predictive_scale *= 0.3
                 logger.info(
                     "Predictive: multi-horizon EXIT on %d symbols → scale 0.3×",

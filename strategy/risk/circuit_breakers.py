@@ -9,6 +9,7 @@ Layer 5: Venue liquidity collapse detection
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -56,12 +57,13 @@ class CircuitBreakerConfig:
     cascade_risk_threshold: float = 0.70
     # Liquidity: current depth / 24h avg
     min_book_depth_ratio: float = 0.30
-    # Cooldown after trigger fires
-    cooldown_secs: int = 3600  # 1 hour
+    # Cooldown after trigger fires — shorter on mainnet (real oracles recover faster)
+    cooldown_secs: int = int(os.getenv("CB_COOLDOWN_SECS", "1800"))  # 30min default
     # Oracle manipulation defense: reject if oracle moves > N sigma in 1 slot
     # Based on Mango Markets exploit lessons — non-negotiable on Solana
-    oracle_move_sigma_threshold: float = 8.0  # devnet oracles are noisy; was 3.0
-    oracle_move_window: int = 20  # wider window gives more stable sigma estimate
+    # Mainnet: 5.0 (legitimate moves rarely exceed 5σ); devnet: 8.0+ (noisy feeds)
+    oracle_move_sigma_threshold: float = float(os.getenv("ORACLE_SIGMA_THRESHOLD", "5.0"))
+    oracle_move_window: int = int(os.getenv("ORACLE_MOVE_WINDOW", "20"))
 
 
 class CircuitBreaker:

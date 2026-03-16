@@ -1,3 +1,15 @@
+# ── Stage 1: build ──────────────────────────────────────────────────────────
+FROM node:24-slim AS builder
+
+WORKDIR /app
+
+COPY bot/package*.json ./bot/
+RUN cd bot && npm install --legacy-peer-deps
+
+COPY bot/ ./bot/
+RUN cd bot && npm run build
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM node:24-slim
 
 WORKDIR /app
@@ -5,8 +17,7 @@ WORKDIR /app
 COPY bot/package*.json ./bot/
 RUN cd bot && npm install --omit=dev --legacy-peer-deps
 
-COPY bot/ ./bot/
-RUN cd bot && npm run build
+COPY --from=builder /app/bot/dist ./bot/dist
 
 RUN mkdir -p /app/logs
 

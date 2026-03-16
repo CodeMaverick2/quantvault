@@ -737,7 +737,9 @@ def _build_report_html() -> tuple[str, str]:
 
     cb_state = circuit_breaker.state.value
     dd_halted = drawdown_ctrl.is_halted
-    pos_scale = circuit_breaker.get_position_multiplier() * drawdown_ctrl.get_scale()
+    dd_state = drawdown_ctrl.record_nav(_get_current_nav(), time.time()) if _get_current_nav() > 0 else None
+    dd_scale = dd_state.position_scale if dd_state else 1.0
+    pos_scale = circuit_breaker.get_position_multiplier() * dd_scale
 
     # ── Market state (cascade_risk already stored by update-market) ───────────
     funding_rates = {sym: s.get("funding_apr", 0) for sym, s in _market_state.items()}
@@ -768,7 +770,7 @@ def _build_report_html() -> tuple[str, str]:
             ],
             regime=_latest_regime.regime if _latest_regime else MarketRegime.SIDEWAYS,
             regime_confidence=regime_conf,
-            drawdown_scale=drawdown_ctrl.get_scale(),
+            drawdown_scale=dd_scale,
             cb_scale=circuit_breaker.get_position_multiplier(),
             kamino_apr=5.0,
             drift_spot_apr=5.0,

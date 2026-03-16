@@ -48,7 +48,9 @@ class CircuitBreakerEvent:
 @dataclass
 class CircuitBreakerConfig:
     # Funding rate cost ceiling (annualized)
-    max_negative_funding_apr: float = -0.45      # -45% APR = exit all
+    # Devnet: set MAX_NEGATIVE_FUNDING_APR=-10.0 (−1000%) to bypass garbage devnet rates
+    # Mainnet: keep at -0.45 (−45% APR)
+    max_negative_funding_apr: float = float(os.getenv("MAX_NEGATIVE_FUNDING_APR", "-0.45"))
     # Perp/spot divergence
     max_basis_pct: float = 0.02                  # 2%
     # Oracle deviation vs. CEX reference
@@ -254,10 +256,10 @@ class CircuitBreaker:
         if self._state == CircuitBreakerState.TRIGGERED:
             return 0.0
         if self._state == CircuitBreakerState.COOLING_DOWN:
-            # Linearly scale back up during cooldown
+            # Linearly ramp from 0 → 1.0 over full cooldown period
             elapsed = time.time() - self._last_trigger_ts
             fraction = min(1.0, elapsed / self.config.cooldown_secs)
-            return fraction * 0.5  # max 50% during cooldown ramp-up
+            return fraction  # reaches full 1.0x at cooldown expiry
         return 1.0  # NORMAL or WARNING
 
     def _log_event(self, name: str, value: float, threshold: float) -> None:

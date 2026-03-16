@@ -2,7 +2,7 @@ strategy:
   name: "QuantVault AMDN"
   version: "1.0.0"
   base_asset: "USDC"
-  target_funding_apr_threshold: 10.0  # min APR to enter perp position
+  target_funding_apr_threshold: 8.0   # min APR to enter perp position
   max_leverage: 2.0
   min_health_buffer: 0.30             # 30% cushion above liquidation level
 
@@ -39,7 +39,7 @@ risk:
   max_negative_funding_apr: -0.45
   max_oracle_deviation_pct: 0.005
   max_position_pct_nav: 0.30
-  circuit_breaker_cooldown_minutes: 60
+  circuit_breaker_cooldown_minutes: 30
 
 markets:
   perp:

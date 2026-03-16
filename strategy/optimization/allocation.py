@@ -97,7 +97,7 @@ class AllocationConfig:
     # Env-configurable: lower on mainnet when funding is reliable; raise on devnet noise
     target_funding_apr_threshold: float = float(os.getenv("MIN_FUNDING_APR_THRESHOLD", "8.0"))
     min_persistence_score: float = 0.55          # gate: minimum entry quality
-    min_consecutive_positive: int = 3            # gate: minimum consecutive positive hours
+    min_consecutive_positive: int = int(os.getenv("MIN_CONSECUTIVE_POSITIVE", "2"))  # gate: minimum consecutive positive hours
     target_vol: float = 0.15                     # target portfolio vol for vol-targeting
     cascade_risk_entry_gate: float = 0.50        # max cascade risk to allow entry
     inverse_carry_threshold: float = 5.0         # |funding_apr| must exceed this for inverse carry
@@ -450,7 +450,7 @@ class DynamicAllocationOptimizer:
             kelly_raw = kelly_position_size(
                 expected_return=period_return,
                 variance=period_variance,
-                fraction=0.25,   # 25% fractional Kelly
+                fraction=0.35,   # 35% fractional Kelly — more aggressive than quarter-Kelly
                 max_pct=self.config.max_single_perp_pct,
             )
 

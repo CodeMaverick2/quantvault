@@ -44,6 +44,7 @@ from .signals.tod_optimizer import TimeOfDayOptimizer
 from .signals.multi_horizon_forecaster import MultiHorizonForecaster
 from .signals.regime_transition import RegimeTransitionForecaster
 from .signals.leading_indicators import LeadingIndicatorEngine
+from .signals.cointegration import CointegrationEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -186,6 +187,15 @@ _tod_optimizer = TimeOfDayOptimizer()
 _mh_forecaster = MultiHorizonForecaster()        # AR(4) iterative 1/6/24/72h forecast
 _transition_forecaster = RegimeTransitionForecaster()  # HMM A^N transition probs
 _leading_engine = LeadingIndicatorEngine()        # OI + basis + liquidation leads
+
+# Stat arb: Johansen cointegration across correlated perp pairs
+_cointegration_engine = CointegrationEngine(
+    entry_z_score=CFG["cointegration"]["entry_z_score"],
+    exit_z_score=CFG["cointegration"]["exit_z_score"],
+    stop_loss_z_score=CFG["cointegration"]["stop_loss_z_score"],
+    max_allocation_pct=CFG["cointegration"]["max_allocation_pct"],
+)
+_stat_arb_signals: dict[str, object] = {}   # latest signals keyed by pair
 
 # Threading/async safety locks
 _market_state_lock = asyncio.Lock()
@@ -390,6 +400,15 @@ async def get_signals():
             }
             for sym, state in _market_state.items()
         },
+        "stat_arb": {
+            pair: {
+                "z_score": float(sig.z_score),
+                "action": sig.action,
+                "beta": float(sig.beta),
+                "confidence": float(sig.confidence),
+            }
+            for pair, sig in _stat_arb_signals.items()
+        },
     }
 
 
@@ -481,11 +500,37 @@ async def get_allocations():
         leading_indicators=leading_signals,
     )
 
+    # ── Stat arb overlay ─────────────────────────────────────────────────────
+    # Carve out up to max_stat_arb_pct from lending when a pair has an active signal.
+    # Confidence-weighted so only high-conviction trades get meaningful allocation.
+    stat_arb_allocs: dict[str, float] = {}
+    stat_arb_budget_used = 0.0
+    max_stat_arb = optimizer.config.max_stat_arb_pct  # 15% max
+    for pair, sig in _stat_arb_signals.items():
+        if sig.action in ("ENTER_LONG_SPREAD", "ENTER_SHORT_SPREAD") and sig.confidence > 0.5:
+            alloc = min(max_stat_arb * sig.confidence, max_stat_arb - stat_arb_budget_used)
+            if alloc > 0.01:
+                stat_arb_allocs[pair] = alloc
+                stat_arb_budget_used += alloc
+
+    # Reduce lending proportionally to fund stat arb
+    if stat_arb_budget_used > 0:
+        lending_reduction = min(stat_arb_budget_used, result.total_lending_pct - optimizer.config.min_lending_pct)
+        if lending_reduction > 0:
+            ratio = 1.0 - (lending_reduction / result.total_lending_pct)
+            result.kamino_lending_pct *= ratio
+            result.drift_spot_lending_pct *= ratio
+            result.total_lending_pct *= ratio
+        result.stat_arb_allocations = stat_arb_allocs
+        logger.info("StatArb overlay: %d active pairs, budget=%.1f%%",
+                    len(stat_arb_allocs), stat_arb_budget_used * 100)
+
     return {
         "kamino_lending_pct": result.kamino_lending_pct,
         "drift_spot_lending_pct": result.drift_spot_lending_pct,
         "perp_allocations": result.perp_allocations,
         "perp_directions": result.perp_directions,  # SHORT or LONG (inverse carry)
+        "stat_arb_allocations": result.stat_arb_allocations,
         "total_perp_pct": result.total_perp_pct,
         "total_lending_pct": result.total_lending_pct,
         "regime": result.regime,
@@ -558,6 +603,20 @@ async def update_market(req: MarketUpdateRequest):
 
     # Keep multi-horizon forecaster current with live funding
     _mh_forecaster.update(req.symbol, req.funding_apr)
+
+    # Update stat arb engine with latest oracle prices across all pairs
+    if req.oracle_price > 0:
+        _prices = {sym: s.get("oracle_price", 0.0) for sym, s in _market_state.items()}
+        _prices[req.symbol] = req.oracle_price
+        for pair in CFG["cointegration"]["pairs"]:
+            sym_a, sym_b = pair[0], pair[1]
+            pa, pb = _prices.get(sym_a, 0.0), _prices.get(sym_b, 0.0)
+            if pa > 0 and pb > 0:
+                sig = _cointegration_engine.update(
+                    sym_a, sym_b,
+                    float(np.log(pa)), float(np.log(pb)),
+                )
+                _stat_arb_signals[sig.pair] = sig
 
     return {
         "cascade_risk": cascade_result.score,

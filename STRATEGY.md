@@ -2,7 +2,7 @@
 
 ## Overview
 
-QuantVault is a USDC-denominated yield vault on Ranger Finance targeting **15–30% APY** via
+QuantVault is a USDC-denominated yield vault on Solana targeting consistent risk-adjusted returns via
 regime-adaptive delta-neutral funding rate capture on Drift Protocol perpetuals.
 
 The strategy combines **nine independent signal layers**: a Hidden Markov Model for regime

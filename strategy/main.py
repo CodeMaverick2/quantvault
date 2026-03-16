@@ -740,7 +740,7 @@ def _gemini_commentary(state_dict: dict) -> str:
         f"Expected APR: {state_dict['exp_apr']:.1f}%",
         f"Position scale: {state_dict['pos_scale']:.2f}x (0=all cash, 1=full exposure)",
         f"Allocation: {state_dict['k_pct']*100:.0f}% Kamino lending, {state_dict['d_pct']*100:.0f}% Drift spot, rest in perps",
-        f"Funding rates: {', '.join(f'{s}: {r*100:.2f}%' for s,r in state_dict['funding_rates'].items())}",
+        f"Funding rates: {', '.join(f'{s}: {r}' for s,r in state_dict['funding_rates'].items())}",
         f"Rebalances completed: {state_dict['rebal_total']} | Error rate: {state_dict['error_rate']:.1f}%",
     ]
     prompt = (

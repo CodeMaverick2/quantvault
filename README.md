@@ -4,7 +4,7 @@
 
 ## Overview
 
-QuantVault is a fully automated yield strategy vault on Ranger Finance. It captures Drift Protocol perpetual funding rates with short positions while maintaining a base lending yield through Kamino and Drift Spot. A 3-state Hidden Markov Model continuously detects market regimes and scales positions — fully exiting perps during crisis conditions.
+QuantVault is a fully automated USDC yield vault on Solana. It captures Drift Protocol perpetual funding rates with short positions while maintaining a base lending yield through Kamino and Drift Spot. A 3-state Hidden Markov Model continuously detects market regimes and scales positions — fully exiting perps during crisis conditions.
 
 **Key stats (live backtest, Feb–Mar 2026):**
 - 116/116 tests passing across all signal modules
@@ -97,7 +97,6 @@ python scripts/train_models.py --validate
 npm run init-vault   # scripts/init_vault.ts (uses @voltr/vault-sdk)
 npm run add-strategies  # scripts/add_strategies.ts
 
-# Or use the Ranger Finance UI: https://vaults.ranger.finance/create
 # Copy VAULT_ADDRESS from config/vault_addresses.json to .env
 ```
 

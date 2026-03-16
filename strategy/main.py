@@ -885,17 +885,39 @@ async def send_report():
     msg.attach(MIMEText(text, "plain"))
     msg.attach(MIMEText(html, "html"))
 
+    resend_key = os.getenv("RESEND_API_KEY")
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(from_email, email_pass)
-            server.sendmail(from_email, to_email, msg.as_string())
-        logger.info("Hourly report sent to %s", to_email)
+        if resend_key:
+            # Use Resend API (HTTPS — works on all cloud platforms)
+            import urllib.request as _urlreq, json as _json
+            payload = _json.dumps({
+                "from": f"QuantVault <onboarding@resend.dev>",
+                "to": [to_email],
+                "subject": f"QuantVault Report {ts}",
+                "html": html,
+                "text": text,
+            }).encode()
+            req = _urlreq.Request(
+                "https://api.resend.com/emails",
+                data=payload,
+                headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urlreq.urlopen(req, timeout=15) as resp:
+                result = _json.loads(resp.read())
+            logger.info("Hourly report sent via Resend to %s (id=%s)", to_email, result.get("id"))
+        else:
+            # Fallback: SMTP
+            with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(from_email, email_pass)
+                server.sendmail(from_email, to_email, msg.as_string())
+            logger.info("Hourly report sent via SMTP to %s", to_email)
         return {"status": "ok", "sent_to": to_email, "ts": ts}
     except Exception as e:
         logger.error("Failed to send report email: %s", e)
-        raise HTTPException(status_code=500, detail=f"SMTP error: {e}")
+        raise HTTPException(status_code=500, detail=f"Email error: {e}")
 
 
 if __name__ == "__main__":

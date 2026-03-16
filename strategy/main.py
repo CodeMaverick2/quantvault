@@ -126,7 +126,11 @@ cascade_scorer = CascadeRiskScorer(
 
 circuit_breaker = CircuitBreaker(
     config=CircuitBreakerConfig(
-        max_negative_funding_apr=CFG["risk"]["max_negative_funding_apr"],
+        # Env var takes priority over YAML — lets devnet bypass the CB on garbage rates
+        max_negative_funding_apr=float(os.getenv(
+            "MAX_NEGATIVE_FUNDING_APR",
+            str(CFG["risk"]["max_negative_funding_apr"]),
+        )),
         max_basis_pct=CFG["risk"]["max_basis_pct"],
         max_oracle_deviation_pct=CFG["risk"]["max_oracle_deviation_pct"],
         cascade_risk_threshold=CFG["risk"]["cascade_risk_threshold"],

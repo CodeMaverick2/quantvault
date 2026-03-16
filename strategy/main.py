@@ -163,6 +163,11 @@ _market_state: dict[str, dict] = {
     }
     for sym in SYMBOLS
 }
+# Rolling 6h funding rate history per symbol for peak/deterioration tracking.
+# At 1 update/minute, 360 entries = 6h.
+_funding_history_6h: dict[str, collections.deque] = {
+    sym: collections.deque(maxlen=360) for sym in SYMBOLS
+}
 _latest_regime: Optional[RegimePrediction] = None
 _latest_fast_regime: Optional[RegimePrediction] = None
 _kamino_apr: float = 5.0
@@ -461,6 +466,7 @@ async def get_allocations():
             cascade_risk=_market_state[sym]["cascade_risk"],
             persistence_score=persistence_results[sym].entry_quality if sym in persistence_results else 1.0,
             consecutive_positive=persistence_results[sym].consecutive_positive if sym in persistence_results else 0,
+            funding_peak_6h=_market_state[sym].get("funding_peak_6h"),
         )
         for sym in SYMBOLS
     ]
@@ -562,6 +568,15 @@ async def update_market(req: MarketUpdateRequest):
     )
     cascade_result = cascade_scorer.score(cascade_input)
 
+    # Track 6h rolling funding history for deterioration detection
+    if req.symbol in _funding_history_6h and req.funding_apr != 0.0:
+        _funding_history_6h[req.symbol].append(req.funding_apr)
+    funding_peak_6h: Optional[float] = (
+        max(_funding_history_6h[req.symbol])
+        if req.symbol in _funding_history_6h and len(_funding_history_6h[req.symbol]) >= 3
+        else None
+    )
+
     _market_state[req.symbol].update({
         "funding_apr": req.funding_apr,
         "ob_imbalance": req.ob_imbalance,
@@ -569,6 +584,7 @@ async def update_market(req: MarketUpdateRequest):
         "oracle_price": req.oracle_price,
         "lending_apr": req.lending_apr,
         "cascade_risk": cascade_result.score,
+        "funding_peak_6h": funding_peak_6h,
         "updated_at": time.time(),
     })
 

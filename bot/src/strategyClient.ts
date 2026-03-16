@@ -25,6 +25,7 @@ export interface AllocationResponse {
   kamino_lending_pct: number;
   drift_spot_lending_pct: number;
   perp_allocations: Record<string, number>;
+  perp_directions: Record<string, "SHORT" | "LONG">;
   total_perp_pct: number;
   total_lending_pct: number;
   regime: string;

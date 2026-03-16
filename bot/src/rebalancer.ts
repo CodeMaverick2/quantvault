@@ -66,7 +66,23 @@ export class Rebalancer {
     }
   }
 
+  /**
+   * Drift pays funding every hour at :00 UTC.
+   * Avoid rebalancing in the ±5 minute window around payment time to prevent
+   * adverse fills during the brief liquidity squeeze that precedes/follows payment.
+   */
+  private isNearFundingPayment(): boolean {
+    const minutesIntoHour = new Date().getUTCMinutes();
+    return minutesIntoHour >= 55 || minutesIntoHour <= 4;
+  }
+
   private async executeNormalRebalance(): Promise<void> {
+    // Hold off during the funding payment window to avoid adverse fills
+    if (this.isNearFundingPayment()) {
+      logger.info("Near funding payment window (:00 UTC ±5min) — skipping rebalance");
+      return;
+    }
+
     // 1. Get current state
     const [allocations, regime, hedgeRatios, positions, nav] = await Promise.all([
       this.strategyClient.getAllocations(),
@@ -133,22 +149,30 @@ export class Rebalancer {
 
       try {
         const orderId = OrderExecutor.newOrderId();
+        // Use direction from strategy engine: SHORT (standard carry) or LONG (inverse carry)
+        const stratDirection = (allocations.perp_directions?.[sym] ?? "SHORT") as "SHORT" | "LONG";
+        const isLong = stratDirection === "LONG";
+
         if (delta > 0) {
-          logger.info(`${sym}: increase short by $${delta.toFixed(0)}`);
+          // Increasing position: go further in the strategy direction
+          const execDir = isLong ? "long" : "short";
+          logger.info(`${sym}: increase ${stratDirection} by $${delta.toFixed(0)}`);
           await this.executor.placeOrder({
             id: orderId,
             marketIndex: MARKET_INDEXES[sym] ?? 0,
-            direction: "short",
+            direction: execDir,
             sizeUsd: delta,
             status: "pending",
             attempts: 0,
           }, snap.oraclePrice);
         } else {
-          logger.info(`${sym}: reduce short by $${Math.abs(delta).toFixed(0)}`);
+          // Reducing position: go against the strategy direction to reduce
+          const execDir = isLong ? "short" : "long";
+          logger.info(`${sym}: reduce ${stratDirection} by $${Math.abs(delta).toFixed(0)}`);
           await this.executor.placeOrder({
             id: orderId,
             marketIndex: MARKET_INDEXES[sym] ?? 0,
-            direction: "long",
+            direction: execDir,
             sizeUsd: Math.abs(delta),
             status: "pending",
             attempts: 0,

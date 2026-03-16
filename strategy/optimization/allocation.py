@@ -49,6 +49,9 @@ class MarketYieldData:
     # Inverse carry: when funding is deeply negative, LONG perp + short spot
     # Net yield = |funding_apr| - spot_borrow_cost_apr
     spot_borrow_cost_apr: float = 5.0  # cost to borrow asset for spot short hedge (%)
+    # Peak funding over last 6h — used for deterioration exit logic.
+    # None means no historical peak is available (skip deterioration check).
+    funding_peak_6h: Optional[float] = None
 
 
 @dataclass
@@ -105,6 +108,18 @@ class AllocationConfig:
     # How many symbols must signal exit before applying 0.3x scale reduction
     # Set to 3 to require unanimous exit signal (prevents premature scale reduction)
     predictive_exit_quorum: int = int(os.getenv("PREDICTIVE_EXIT_QUORUM", "3"))
+
+    # ── NEW: Smart capital management ─────────────────────────────────────────
+    # Opportunity cost gate: perp must beat best lending APR by this margin to justify risk
+    min_perp_edge_apr: float = float(os.getenv("MIN_PERP_EDGE_APR", "3.0"))
+    # Dry powder: always keep this % as undeployed buffer for crash opportunities
+    dry_powder_pct: float = float(os.getenv("DRY_POWDER_PCT", "0.05"))
+    # Funding deterioration exit: if funding drops this many pp from its 6h peak, reduce by 40%
+    funding_deterioration_threshold: float = float(os.getenv("FUNDING_DETERIORATION_PCT", "5.0"))
+    # Acceleration boost: multiply Kelly by this when funding is actively accelerating
+    acceleration_boost: float = float(os.getenv("ACCELERATION_BOOST", "1.20"))
+    # Concentration boost: when best market funding is >2x next best, overweight by this factor
+    top_market_concentration_factor: float = float(os.getenv("TOP_MARKET_CONCENTRATION", "1.5"))
 
 
 class DynamicAllocationOptimizer:
@@ -308,6 +323,7 @@ class DynamicAllocationOptimizer:
         # ── Layer 2: Funding quality gate ────────────────────────────────────
         # Standard carry: positive funding above threshold
         # Inverse carry: deeply negative funding, net yield = |apr| - borrow_cost > min
+        best_lending_apr = max(kamino_apr, drift_spot_apr)
         eligible_markets = []
         for m in markets:
             if not m.is_perp:
@@ -317,7 +333,9 @@ class DynamicAllocationOptimizer:
             # Standard carry (SHORT perp): positive funding
             if (m.funding_apr >= self.config.target_funding_apr_threshold
                     and m.persistence_score >= self.config.min_persistence_score
-                    and m.consecutive_positive >= self.config.min_consecutive_positive):
+                    and m.consecutive_positive >= self.config.min_consecutive_positive
+                    # Opportunity cost gate: perp must beat best lending by min_perp_edge_apr
+                    and (m.funding_apr - best_lending_apr) >= self.config.min_perp_edge_apr):
                 eligible_markets.append(m)
             # Inverse carry (LONG perp + short spot): negative funding
             elif (m.funding_apr < -self.config.inverse_carry_threshold
@@ -328,14 +346,20 @@ class DynamicAllocationOptimizer:
         # ── Layer 3+4+5+6+7: Kelly × cascade × vol × ATR × ToD ──────────────
         # ToD multiplier concentrates size during historically rich UTC windows
         # Clipped separately so regime_scale and external_scale remain unaffected
+        # Dry powder: reserve a small buffer of NAV for crash opportunities / margin
         tod_scale = float(np.clip(tod_multiplier, 0.5, 1.5))
-        perp_budget = self.config.max_perp_pct * effective_scale * tod_scale
+        perp_budget = (
+            self.config.max_perp_pct
+            * effective_scale
+            * tod_scale
+            * (1.0 - self.config.dry_powder_pct)
+        )
         perp_allocs: dict[str, float] = {}
         sizing_breakdown: dict[str, dict] = {}
 
         if eligible_markets and perp_budget > 0.01:
             perp_allocs, sizing_breakdown, perp_dirs = self._allocate_perps(
-                eligible_markets, perp_budget
+                eligible_markets, perp_budget, multi_horizon_forecasts
             )
         else:
             perp_dirs = {}
@@ -418,6 +442,7 @@ class DynamicAllocationOptimizer:
         self,
         markets: list[MarketYieldData],
         budget: float,
+        multi_horizon_forecasts: dict[str, MultiHorizonForecast] | None = None,
     ) -> tuple[dict[str, float], dict[str, dict], dict[str, str]]:
         """
         Allocate perp budget using Kelly × (1 - cascade) × vol_adjustment.
@@ -473,12 +498,39 @@ class DynamicAllocationOptimizer:
 
             final_size = cascade_adj * vol_scale * atr_leverage_scale
 
+            # Acceleration boost: when multi-horizon forecast shows RISING trajectory,
+            # funding is actively accelerating — add conviction to position size
+            accel_boost = 1.0
+            if multi_horizon_forecasts and m.symbol in multi_horizon_forecasts:
+                forecast = multi_horizon_forecasts[m.symbol]
+                if forecast.trajectory == FundingTrajectory.RISING:
+                    accel_boost = self.config.acceleration_boost
+                    final_size *= accel_boost
+                    logger.debug("%s: acceleration boost %.2f× (RISING trajectory)", m.symbol, accel_boost)
+
+            # Deterioration exit: if funding has dropped significantly from its 6h peak,
+            # reduce conviction — the carry is unwinding
+            deterioration_scale = 1.0
+            if (m.funding_peak_6h is not None
+                    and m.funding_peak_6h > 0
+                    and not is_inverse):
+                drop = m.funding_peak_6h - m.funding_apr  # pp decline from peak
+                if drop >= self.config.funding_deterioration_threshold:
+                    deterioration_scale = 0.60  # 40% reduction
+                    final_size *= deterioration_scale
+                    logger.info(
+                        "%s: funding deterioration %.1fpp from peak (%.1f→%.1f) — 40%% scale reduction",
+                        m.symbol, drop, m.funding_peak_6h, m.funding_apr,
+                    )
+
             kelly_cascade_sizes[m.symbol] = max(final_size, 0.0)
             breakdown[m.symbol] = {
                 "kelly_raw": round(kelly_raw, 4),
                 "cascade_adj": round(cascade_adj, 4),
                 "vol_scale": round(vol_scale, 4),
                 "atr_leverage_scale": round(atr_leverage_scale, 4),
+                "accel_boost": round(accel_boost, 4),
+                "deterioration_scale": round(deterioration_scale, 4),
                 "final_pre_budget": round(final_size, 4),
                 "funding_apr": m.funding_apr,
                 "effective_apr": round(effective_apr, 2),
@@ -506,6 +558,35 @@ class DynamicAllocationOptimizer:
         if total_alloc > budget:
             scale = budget / total_alloc
             allocs = {sym: v * scale for sym, v in allocs.items()}
+
+        # Top-market concentration: when one market has clearly superior funding,
+        # overweight it and trim the others to concentrate in the best opportunity.
+        # Only triggers when best market has >2× the funding of the next best.
+        if len(allocs) >= 2:
+            effective_aprs = {m.symbol: (abs(m.funding_apr) - m.spot_borrow_cost_apr
+                                         if m.funding_apr < -self.config.inverse_carry_threshold
+                                         else m.funding_apr)
+                              for m in markets if m.symbol in allocs}
+            sorted_by_apr = sorted(effective_aprs.items(), key=lambda x: x[1], reverse=True)
+            best_sym, best_apr = sorted_by_apr[0]
+            second_apr = sorted_by_apr[1][1] if len(sorted_by_apr) > 1 else 0.0
+            if best_apr > 0 and second_apr > 0 and best_apr >= 2.0 * second_apr:
+                factor = self.config.top_market_concentration_factor
+                raw_boost = allocs[best_sym] * factor
+                boost_amount = min(raw_boost, self.config.max_single_perp_pct) - allocs[best_sym]
+                if boost_amount > 0:
+                    # Trim others proportionally to fund the boost
+                    other_total = sum(v for sym, v in allocs.items() if sym != best_sym)
+                    if other_total > boost_amount:
+                        trim_ratio = (other_total - boost_amount) / other_total
+                        allocs = {
+                            sym: (v * trim_ratio if sym != best_sym else v + boost_amount)
+                            for sym, v in allocs.items()
+                        }
+                        logger.info(
+                            "Top-market concentration: overweighting %s (%.1f%% APR vs %.1f%% next best) by %.2f×",
+                            best_sym, best_apr, second_apr, factor,
+                        )
 
         final_allocs = {sym: v for sym, v in allocs.items() if v > 0.005}
         final_directions = {sym: directions[sym] for sym in final_allocs if sym in directions}

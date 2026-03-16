@@ -739,9 +739,9 @@ def _build_report_html() -> tuple[str, str]:
     dd_halted = drawdown_ctrl.is_halted
     pos_scale = circuit_breaker.get_position_multiplier() * drawdown_ctrl.get_scale()
 
-    # ── Market state ──────────────────────────────────────────────────────────
+    # ── Market state (cascade_risk already stored by update-market) ───────────
     funding_rates = {sym: s.get("funding_apr", 0) for sym, s in _market_state.items()}
-    cascade_risks = {sym: float(_cascade_scorer.get_score(sym)) for sym in _market_state}
+    cascade_risks = {sym: float(s.get("cascade_risk", 0)) for sym, s in _market_state.items()}
 
     # ── Prometheus (keeper bot metrics) ───────────────────────────────────────
     prom = _fetch_prometheus_metrics()
@@ -752,6 +752,7 @@ def _build_report_html() -> tuple[str, str]:
 
     # ── Allocation snapshot ───────────────────────────────────────────────────
     try:
+        persistence_results = _persistence_scorer.score_all(list(_market_state.keys()))
         alloc_result = _allocation_optimizer.compute(
             markets=[
                 MarketYieldData(
@@ -759,13 +760,13 @@ def _build_report_html() -> tuple[str, str]:
                     funding_apr=s.get("funding_apr", 0),
                     lending_apr=s.get("lending_apr", 0),
                     is_perp=True,
-                    cascade_risk=float(_cascade_scorer.get_score(sym)),
-                    persistence_score=_persistence_scorer.get_score(sym),
-                    consecutive_positive=_persistence_scorer.get_consecutive_positive(sym),
+                    cascade_risk=float(s.get("cascade_risk", 0)),
+                    persistence_score=persistence_results.get(sym).score if persistence_results.get(sym) else 0.5,
+                    consecutive_positive=persistence_results.get(sym).consecutive_positive if persistence_results.get(sym) else 0,
                 )
                 for sym, s in _market_state.items()
             ],
-            regime=_latest_regime.regime if _latest_regime else __import__("strategy.models.hmm_regime", fromlist=["MarketRegime"]).MarketRegime.SIDEWAYS,
+            regime=_latest_regime.regime if _latest_regime else MarketRegime.SIDEWAYS,
             regime_confidence=regime_conf,
             drawdown_scale=drawdown_ctrl.get_scale(),
             cb_scale=circuit_breaker.get_position_multiplier(),

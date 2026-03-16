@@ -280,7 +280,7 @@ async def get_regime():
         }
 
     try:
-        X = np.array(_hmm_feature_buffer[-HMM_BUFFER_SIZE:])
+        X = np.array(list(_hmm_feature_buffer)[-HMM_BUFFER_SIZE:])
         prediction = hmm.predict(X)
         global _latest_regime
         _latest_regime = prediction

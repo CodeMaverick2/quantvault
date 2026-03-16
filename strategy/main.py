@@ -755,7 +755,7 @@ def _gemini_commentary(state_dict: dict) -> str:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": 220, "temperature": 0.3},
     }).encode()
-    model = "gemini-2.0-flash"
+    model = "gemini-1.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     logger.info("Gemini: calling model=%s", model)
     req = _urlreq.Request(

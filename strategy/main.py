@@ -753,7 +753,7 @@ def _build_report_html() -> tuple[str, str]:
     # ── Allocation snapshot ───────────────────────────────────────────────────
     try:
         persistence_results = _persistence_scorer.score_all(list(_market_state.keys()))
-        alloc_result = _allocation_optimizer.compute(
+        alloc_result = optimizer.compute(
             markets=[
                 MarketYieldData(
                     symbol=sym,
@@ -761,8 +761,8 @@ def _build_report_html() -> tuple[str, str]:
                     lending_apr=s.get("lending_apr", 0),
                     is_perp=True,
                     cascade_risk=float(s.get("cascade_risk", 0)),
-                    persistence_score=persistence_results.get(sym).score if persistence_results.get(sym) else 0.5,
-                    consecutive_positive=persistence_results.get(sym).consecutive_positive if persistence_results.get(sym) else 0,
+                    persistence_score=persistence_results[sym].persistence_score if sym in persistence_results else 0.5,
+                    consecutive_positive=persistence_results[sym].consecutive_positive if sym in persistence_results else 0,
                 )
                 for sym, s in _market_state.items()
             ],
@@ -873,6 +873,7 @@ async def send_report():
     try:
         html, text, ts = _build_report_html()
     except Exception as e:
+        logger.exception("Report build failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Report build failed: {e}")
 
     msg = MIMEMultipart("alternative")

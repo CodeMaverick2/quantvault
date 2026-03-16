@@ -868,172 +868,269 @@ def _build_report_html() -> tuple[str, str]:
     except Exception:
         exp_apr, perp_allocs, k_pct, d_pct = 0.0, {}, 0.0, 0.0
 
-    # ── Human-readable labels ─────────────────────────────────────────────────
-    REGIME_EMOJI = {"BULL_CARRY": "🟢", "SIDEWAYS": "🟡", "HIGH_VOL_CRISIS": "🔴"}
-    REGIME_DESC  = {
-        "BULL_CARRY":      "Longs are paying shorts — good for collecting funding. Full perp exposure active.",
-        "SIDEWAYS":        "Funding rates are low or mixed. Mostly in lending, minimal perp exposure.",
-        "HIGH_VOL_CRISIS": "High volatility detected. Inverse carry mode — longing perps to collect negative funding.",
-        "UNKNOWN":         "Not enough data yet to classify regime. Staying in lending-only safe mode.",
+    # ── Labels ────────────────────────────────────────────────────────────────
+    REGIME_DESC = {
+        "BULL_CARRY":      "Longs are paying shorts to hold positions. Optimal conditions for funding capture.",
+        "SIDEWAYS":        "Funding rates are low or mixed. Capital rotated to safer lending positions.",
+        "HIGH_VOL_CRISIS": "High volatility detected. Strategy is in inverse carry mode, collecting negative funding.",
+        "UNKNOWN":         "Insufficient data to classify regime. Holding lending-only defensive posture.",
     }
     CB_DESC = {
-        "NORMAL":       "All clear — no risk triggers.",
-        "WARNING":       "Minor signal triggered. Monitoring closely.",
-        "TRIGGERED":    "Risk event detected. All perp positions closed.",
-        "COOLING_DOWN": "Recovering after a risk event. Positions ramping back up gradually.",
+        "NORMAL":       "All systems nominal.",
+        "WARNING":      "Minor signal triggered. Monitoring closely.",
+        "TRIGGERED":    "Risk threshold breached. All derivative positions closed.",
+        "COOLING_DOWN": "Post-event cooldown. Positions scaling back up linearly.",
     }
     SCALE_DESC = (
-        "Full exposure" if pos_scale >= 0.95
-        else f"Reduced to {pos_scale*100:.0f}% of normal size (risk management active)"
+        "Full deployment" if pos_scale >= 0.95
+        else f"{pos_scale*100:.0f}% deployment (risk controls active)"
         if pos_scale > 0
-        else "Zero exposure — all capital in safe lending"
+        else "0% — all capital in lending (risk halt)"
     )
+    overall_status = ("OPERATIONAL" if cb_state == "NORMAL" and not dd_halted
+                      else "DEGRADED" if cb_state != "TRIGGERED" else "HALTED")
+    status_color = "#1a7f4b" if overall_status == "OPERATIONAL" else ("#b45309" if overall_status == "DEGRADED" else "#991b1b")
+    nav_dir = "+" if nav_change_usd >= 0 else ""
+    nav_dir_color = "#16a34a" if nav_change_usd >= 0 else "#dc2626"
 
-    overall = ("✅ OPERATIONAL" if cb_state == "NORMAL" and not dd_halted
-               else "⚠️ DEGRADED" if cb_state != "TRIGGERED" else "🔴 HALTED")
-    r_emoji = REGIME_EMOJI.get(regime_name, "⚪")
-    nav_color = "green" if nav_change_usd >= 0 else "red"
-    nav_arrow = "▲" if nav_change_usd > 0 else ("▼" if nav_change_usd < 0 else "—")
+    # ── AR predictions per symbol ─────────────────────────────────────────────
+    ar_preds = {}
+    for sym in list(_market_state.keys()):
+        try:
+            pred = _ar_predictor.predict(sym)
+            ar_preds[sym] = pred.predicted_apr if pred else None
+        except Exception:
+            ar_preds[sym] = None
+
+    # ── Persistence per symbol ────────────────────────────────────────────────
+    persist_scores = {}
+    consec_positive = {}
+    try:
+        pr = _persistence_scorer.score_all(list(_market_state.keys()))
+        for sym, res in pr.items():
+            persist_scores[sym] = res.persistence_score
+            consec_positive[sym] = res.consecutive_positive
+    except Exception:
+        pass
+
+    # ── CB recent events ──────────────────────────────────────────────────────
+    recent_cb = [e.trigger_name for e in circuit_breaker.recent_events(3) if e.is_active]
 
     # ── Gemini AI commentary ──────────────────────────────────────────────────
     ai_commentary = _gemini_commentary({
-        "nav": nav_usd, "nav_change_str": nav_change_str,
-        "regime": regime_name, "regime_conf": regime_conf,
-        "cb_state": cb_state, "exp_apr": exp_apr,
-        "pos_scale": pos_scale, "k_pct": k_pct, "d_pct": d_pct,
-        "funding_rates": funding_rates, "rebal_total": rebal_total,
+        "nav": nav_usd,
+        "nav_change_str": nav_change_str,
+        "nav_change_pct": nav_change_pct,
+        "regime": regime_name,
+        "regime_conf": regime_conf,
+        "regime_probs": {k: f"{v*100:.0f}%" for k, v in regime_probs.items()},
+        "cb_state": cb_state,
+        "recent_cb_events": recent_cb or ["none"],
+        "exp_apr": exp_apr,
+        "pos_scale": pos_scale,
+        "k_pct": k_pct,
+        "d_pct": d_pct,
+        "perp_allocs": {k: f"{v*100:.1f}%" for k, v in perp_allocs.items()},
+        "funding_rates": {s: f"{r*100:.2f}%" for s, r in funding_rates.items()},
+        "ar_predictions": {s: (f"{v*100:.2f}%" if v is not None else "unavailable") for s, v in ar_preds.items()},
+        "persistence_scores": {s: f"{v:.2f}" for s, v in persist_scores.items()},
+        "consecutive_positive_hours": consec_positive,
+        "cascade_risks": {s: f"{v:.2f}" for s, v in cascade_risks.items()},
+        "rebal_total": rebal_total,
         "error_rate": error_rate,
+        "uptime": uptime_str,
+        "dd_halted": dd_halted,
+        "dd_scale": dd_scale,
     })
-    ai_block = (
-        f'<div class="card"><h2>🤖 AI Commentary</h2>'
-        f'<p style="font-size:14px;line-height:1.6;color:#d1d5db;margin:0">{ai_commentary}</p></div>'
+
+    # ── Fund rows ─────────────────────────────────────────────────────────────
+    fund_rows = ""
+    for sym, apr in sorted(funding_rates.items(), key=lambda x: -x[1]):
+        apr_pct = apr * 100
+        cr = cascade_risks.get(sym, 0)
+        alloc = perp_allocs.get(sym, 0) * 100
+        ar_str = f"{ar_preds[sym]*100:.2f}%" if ar_preds.get(sym) is not None else "—"
+        consec = consec_positive.get(sym, 0)
+        apr_color = "#16a34a" if apr_pct > 5 else ("#d97706" if apr_pct >= 0 else "#dc2626")
+        cr_color  = "#dc2626" if cr > 0.7 else ("#d97706" if cr > 0.5 else "#16a34a")
+        fund_rows += (
+            f"<tr>"
+            f"<td style='font-weight:600;color:#1e293b'>{sym}</td>"
+            f"<td style='color:{apr_color};font-weight:600'>{apr_pct:.2f}%</td>"
+            f"<td style='color:{cr_color}'>{cr:.2f}</td>"
+            f"<td style='color:#475569'>{ar_str}</td>"
+            f"<td style='color:#475569'>{consec}h</td>"
+            f"<td style='font-weight:600;color:#1e293b'>{alloc:.1f}%</td>"
+            f"</tr>"
+        )
+
+    alloc_rows = (
+        f"<tr><td style='color:#475569'>Kamino Lending</td><td style='color:#475569'>~5% APY — low-risk supply</td><td style='font-weight:600;color:#1e293b;text-align:right'>{k_pct*100:.1f}%</td></tr>"
+        f"<tr><td style='color:#475569'>Drift Spot Lending</td><td style='color:#475569'>~5% APY — low-risk supply</td><td style='font-weight:600;color:#1e293b;text-align:right'>{d_pct*100:.1f}%</td></tr>"
+        + "".join(
+            f"<tr><td style='color:#475569'>{sym} Perp Short</td><td style='color:#475569'>Funding capture position</td><td style='font-weight:600;color:#1e293b;text-align:right'>{pct*100:.1f}%</td></tr>"
+            for sym, pct in perp_allocs.items()
+        )
+    )
+
+    regime_rows = "".join(
+        f"<tr><td style='color:#475569'>{r}</td><td style='text-align:right;font-weight:600;color:#1e293b'>{v*100:.1f}%</td></tr>"
+        for r, v in sorted(regime_probs.items(), key=lambda x: -x[1])
+    )
+
+    ai_section = (
+        f"""<tr><td colspan="2" style="padding:0">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0">
+    <tr><td style="background:#f0f9ff;border-left:3px solid #0369a1;padding:16px 18px;border-radius:0 4px 4px 0">
+      <p style="margin:0 0 6px 0;font-size:11px;font-weight:700;color:#0369a1;text-transform:uppercase;letter-spacing:.05em">Strategy Analyst — AI Commentary</p>
+      <p style="margin:0;font-size:13px;line-height:1.7;color:#1e3a5f">{ai_commentary}</p>
+    </td></tr>
+  </table>
+</td></tr>"""
         if ai_commentary else ""
     )
 
-    # ── Fund rows ─────────────────────────────────────────────────────────────
-    fund_rows = "".join(
-        f"<tr>"
-        f"<td><b>{sym}</b></td>"
-        f"<td class=\"{'green' if apr > 0.05 else 'yellow' if apr >= 0 else 'red'}\">"
-        f"{apr*100:.2f}% {'(collecting)' if apr > 0.05 else '(low)' if apr >= 0 else '(negative!)'}</td>"
-        f"<td class=\"{'red' if cascade_risks.get(sym,0) > 0.7 else 'yellow' if cascade_risks.get(sym,0) > 0.5 else 'green'}\">"
-        f"{cascade_risks.get(sym,0):.2f} {'⚠' if cascade_risks.get(sym,0) > 0.5 else '✓'}</td>"
-        f"<td>{perp_allocs.get(sym,0)*100:.1f}%</td></tr>"
-        for sym, apr in sorted(funding_rates.items(), key=lambda x: -x[1])
-    )
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"/>
+<style>
+  body {{margin:0;padding:0;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif}}
+  .wrap {{max-width:660px;margin:0 auto;padding:24px 16px}}
+  .header-bar {{background:#0f172a;padding:20px 28px;border-radius:8px 8px 0 0}}
+  .header-bar h1 {{margin:0;font-size:18px;font-weight:700;color:#f8fafc;letter-spacing:.01em}}
+  .header-bar .meta {{margin:6px 0 0;font-size:12px;color:#94a3b8}}
+  .status-tag {{display:inline-block;padding:2px 10px;border-radius:3px;font-size:11px;font-weight:700;
+    background:{status_color};color:#fff;letter-spacing:.04em;text-transform:uppercase}}
+  .body-wrap {{background:#ffffff;border-radius:0 0 8px 8px;padding:24px 28px}}
+  .section-title {{font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.06em;
+    margin:24px 0 10px;padding-bottom:6px;border-bottom:1px solid #e2e8f0}}
+  .kpi-grid {{display:table;width:100%;border-collapse:separate;border-spacing:8px}}
+  .kpi {{display:table-cell;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;width:25%}}
+  .kpi .lbl {{font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}}
+  .kpi .val {{font-size:20px;font-weight:700;color:#0f172a}}
+  .kpi .sub {{font-size:11px;color:#64748b;margin-top:4px}}
+  table.data {{width:100%;border-collapse:collapse;font-size:13px}}
+  table.data th {{text-align:left;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;
+    letter-spacing:.05em;padding:8px 10px;border-bottom:2px solid #e2e8f0}}
+  table.data td {{padding:10px 10px;border-bottom:1px solid #f1f5f9;color:#334155;font-size:13px}}
+  table.data tr:last-child td {{border-bottom:none}}
+  .footer {{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px;padding-top:16px;border-top:1px solid #e2e8f0}}
+  .divider {{height:1px;background:#f1f5f9;margin:4px 0}}
+</style>
+</head><body><div class="wrap">
 
-    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"/><style>
-body{{font-family:-apple-system,Arial,sans-serif;background:#0a0a0f;color:#e0e0e0;margin:0;padding:0}}
-.container{{max-width:680px;margin:0 auto;padding:20px}}
-.header{{background:linear-gradient(135deg,#1a1a2e,#16213e);padding:24px;border-radius:12px;margin-bottom:16px;border:1px solid #2a2a4a}}
-.header h1{{margin:0;font-size:22px;color:#a78bfa}}.header .sub{{color:#6b7280;font-size:13px;margin-top:6px}}
-.status-pill{{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600;
-  background:{'#14532d' if 'OPERATIONAL' in overall else '#7f1d1d'};
-  color:{'#4ade80' if 'OPERATIONAL' in overall else '#fca5a5'}}}
-.card{{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px;margin-bottom:14px}}
-.card h2{{margin:0 0 14px 0;font-size:13px;color:#9ca3af;text-transform:uppercase;letter-spacing:.06em}}
-.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
-.metric{{background:#0f172a;border-radius:8px;padding:12px}}
-.metric .label{{font-size:11px;color:#6b7280;margin-bottom:3px;text-transform:uppercase}}
-.metric .value{{font-size:22px;font-weight:700;color:#f3f4f6}}
-.metric .sub{{font-size:11px;color:#6b7280;margin-top:3px}}
-.metric .change{{font-size:12px;margin-top:2px}}
-.green{{color:#4ade80!important}}.yellow{{color:#fbbf24!important}}.red{{color:#f87171!important}}.gray{{color:#6b7280!important}}
-.signal-row{{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #1f2937;font-size:13px}}
-.signal-row:last-child{{border-bottom:none}}
-.signal-label{{color:#9ca3af;min-width:140px}}.signal-value{{color:#f3f4f6;font-weight:500;text-align:right}}
-.signal-desc{{color:#6b7280;font-size:11px;margin-top:2px}}
-.alloc-bar{{background:#1f2937;border-radius:4px;height:6px;margin-top:4px;overflow:hidden}}
-.alloc-fill{{height:100%;border-radius:4px;background:linear-gradient(90deg,#7c3aed,#a78bfa)}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th{{text-align:left;color:#6b7280;font-weight:500;padding:7px 8px;border-bottom:1px solid #1f2937;font-size:11px;text-transform:uppercase}}
-td{{padding:9px 8px;border-bottom:1px solid #0f172a;vertical-align:top}}
-.hint{{color:#6b7280;font-size:11px;margin-top:12px;padding:10px;background:#0f172a;border-radius:6px;line-height:1.5}}
-.footer{{text-align:center;color:#4b5563;font-size:11px;padding:16px}}
-</style></head><body><div class="container">
-
-<div class="header">
-  <h1>⚡ QuantVault Hourly Report</h1>
-  <div class="sub">{ts} &nbsp;·&nbsp; Uptime: {uptime_str} &nbsp;·&nbsp; <span class="status-pill">{overall}</span></div>
+<div class="header-bar">
+  <h1>QuantVault — Hourly Strategy Report</h1>
+  <div class="meta">
+    {ts} &nbsp;&nbsp;|&nbsp;&nbsp; Uptime: {uptime_str} &nbsp;&nbsp;|&nbsp;&nbsp;
+    <span class="status-tag">{overall_status}</span>
+  </div>
 </div>
 
-<div class="card"><h2>Portfolio Summary</h2>
-<div class="metric-grid">
-<div class="metric">
-  <div class="label">Vault Balance</div>
-  <div class="value green">${nav_usd:,.2f}</div>
-  <div class="change {nav_color}">{nav_arrow} {nav_change_str}</div>
-</div>
-<div class="metric">
-  <div class="label">Expected Annual Yield</div>
-  <div class="value {'green' if exp_apr >= 10 else 'yellow'}">{exp_apr:.1f}%</div>
-  <div class="sub">Blended across all positions</div>
-</div>
-<div class="metric">
-  <div class="label">Rebalances Done</div>
-  <div class="value">{rebal_total}</div>
-  <div class="sub">Error rate: {error_rate:.1f}%</div>
-</div>
-<div class="metric">
-  <div class="label">Risk System</div>
-  <div class="value {'green' if cb_state=='NORMAL' else 'yellow' if cb_state=='COOLING_DOWN' else 'red'}">{cb_state}</div>
-  <div class="sub">{CB_DESC.get(cb_state, '')}</div>
-</div>
-</div></div>
+<div class="body-wrap">
 
-{ai_block}
+  <div class="section-title">Portfolio Overview</div>
+  <table width="100%" cellpadding="0" cellspacing="8" border="0">
+    <tr>
+      <td width="25%" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;vertical-align:top">
+        <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Vault NAV</div>
+        <div style="font-size:20px;font-weight:700;color:#0f172a">${nav_usd:,.2f}</div>
+        <div style="font-size:11px;color:{nav_dir_color};margin-top:4px">{nav_dir}${abs(nav_change_usd):,.2f} ({nav_dir}{nav_change_pct:.2f}%) vs prior</div>
+      </td>
+      <td width="25%" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;vertical-align:top">
+        <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Expected APR</div>
+        <div style="font-size:20px;font-weight:700;color:{'#16a34a' if exp_apr >= 10 else '#d97706'}">{exp_apr:.1f}%</div>
+        <div style="font-size:11px;color:#64748b;margin-top:4px">Blended yield</div>
+      </td>
+      <td width="25%" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;vertical-align:top">
+        <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Risk Status</div>
+        <div style="font-size:15px;font-weight:700;color:{'#16a34a' if cb_state=='NORMAL' else '#d97706' if cb_state=='COOLING_DOWN' else '#dc2626'}">{cb_state}</div>
+        <div style="font-size:11px;color:#64748b;margin-top:4px">{CB_DESC.get(cb_state,'')}</div>
+      </td>
+      <td width="25%" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;vertical-align:top">
+        <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Rebalances</div>
+        <div style="font-size:20px;font-weight:700;color:#0f172a">{rebal_total}</div>
+        <div style="font-size:11px;color:#64748b;margin-top:4px">Error rate: {error_rate:.1f}%</div>
+      </td>
+    </tr>
+  </table>
 
-<div class="card"><h2>Market Regime</h2>
-<div class="signal-row">
-  <div><span class="signal-label">Current Regime</span><div class="signal-desc">{REGIME_DESC.get(regime_name,'')}</div></div>
-  <span class="signal-value">{r_emoji} {regime_name}<br/><span class="gray" style="font-size:11px">{regime_conf*100:.0f}% confident</span></span>
-</div>
-<div class="signal-row">
-  <div><span class="signal-label">Position Sizing</span><div class="signal-desc">{SCALE_DESC}</div></div>
-  <span class="signal-value">{'<span class="green">'+f"{pos_scale:.2f}x"+'</span>' if pos_scale >= 0.9 else '<span class="yellow">'+f"{pos_scale:.2f}x"+'</span>' if pos_scale > 0 else '<span class="red">0.00x</span>'}</span>
-</div>
-{"".join(f'<div class="signal-row"><span class="signal-label">Probability {r}</span><span class="signal-value">{v*100:.1f}%</span></div>' for r,v in sorted(regime_probs.items(), key=lambda x:-x[1]))}
-</div>
+  <div class="section-title">Strategy Commentary</div>
+  <table width="100%" cellpadding="0" cellspacing="0" border="0">
+    {ai_section if ai_commentary else f'<tr><td style="font-size:13px;color:#64748b;padding:12px 0">Commentary unavailable (AI quota exceeded — report data above is accurate).</td></tr>'}
+  </table>
 
-<div class="card"><h2>Funding Rates (What We Earn)</h2>
-<table>
-  <tr><th>Market</th><th>Funding APR</th><th>Risk Score</th><th>Our Allocation</th></tr>
-  {fund_rows}
-</table>
-<div class="hint">💡 <b>Funding APR</b> is the annualized rate shorts earn from longs. Above 5% = we open a position. Risk Score above 0.5 = we reduce or avoid the position.</div>
-</div>
+  <div class="section-title">Market Regime</div>
+  <table width="100%" cellpadding="0" cellspacing="0" border="0">
+    <tr>
+      <td width="60%" style="vertical-align:top;padding-right:16px">
+        <table class="data" width="100%">
+          <tr><th>Signal</th><th style="text-align:right">Value</th></tr>
+          <tr><td>Active Regime</td><td style="text-align:right;font-weight:600;color:#0f172a">{regime_name}</td></tr>
+          <tr><td>Confidence</td><td style="text-align:right;font-weight:600;color:#0f172a">{regime_conf*100:.0f}%</td></tr>
+          <tr><td>Position Scale</td><td style="text-align:right;font-weight:600;color:#0f172a">{pos_scale:.2f}x</td></tr>
+          <tr><td colspan="2" style="font-size:12px;color:#64748b;padding-top:6px">{REGIME_DESC.get(regime_name,'')}</td></tr>
+        </table>
+      </td>
+      <td width="40%" style="vertical-align:top">
+        <table class="data" width="100%">
+          <tr><th>Regime</th><th style="text-align:right">Probability</th></tr>
+          {regime_rows}
+        </table>
+      </td>
+    </tr>
+  </table>
 
-<div class="card"><h2>Where Your Money Is</h2>
-<div class="signal-row"><span class="signal-label">Kamino Lending (~5% APY)</span><span class="signal-value">{k_pct*100:.1f}%</span></div>
-<div class="alloc-bar"><div class="alloc-fill" style="width:{min(k_pct*100,100):.1f}%"></div></div>
-<div style="margin-bottom:12px"></div>
-<div class="signal-row"><span class="signal-label">Drift Spot Lending (~5% APY)</span><span class="signal-value">{d_pct*100:.1f}%</span></div>
-<div class="alloc-bar"><div class="alloc-fill" style="width:{min(d_pct*100,100):.1f}%"></div></div>
-<div style="margin-bottom:12px"></div>
-{"".join(f'<div class="signal-row"><span class="signal-label">{sym} Perp Short</span><span class="signal-value">{pct*100:.1f}%</span></div><div class="alloc-bar"><div class="alloc-fill" style="width:{min(pct*100,100):.1f}%"></div></div><div style="margin-bottom:12px"></div>' for sym, pct in perp_allocs.items() if pct > 0)}
-<div class="hint">💡 Lending earns a fixed ~5% APY and is always on. Perp shorts earn the funding rate on top — but only when signals are aligned.</div>
-</div>
+  <div class="section-title">Perpetual Futures — Funding Rates</div>
+  <table class="data" width="100%">
+    <tr>
+      <th>Market</th>
+      <th>Funding APR</th>
+      <th>Cascade Risk</th>
+      <th>AR Prediction</th>
+      <th>Positive Hours</th>
+      <th style="text-align:right">Allocation</th>
+    </tr>
+    {fund_rows}
+  </table>
+  <p style="font-size:11px;color:#94a3b8;margin:8px 0 0">Funding APR: annualized rate collected by shorts. AR Prediction: model estimate for next period. Cascade Risk: composite market-stress score (above 0.50 = reduce exposure).</p>
 
-<div class="footer">QuantVault Strategy Engine &nbsp;·&nbsp; {ts}<br/>Next report in ~1 hour &nbsp;·&nbsp; Reply to this email to get help</div>
+  <div class="section-title">Portfolio Allocation</div>
+  <table class="data" width="100%">
+    <tr><th>Position</th><th>Description</th><th style="text-align:right">Weight</th></tr>
+    {alloc_rows}
+  </table>
+
+  <div class="footer">
+    QuantVault Strategy Engine &nbsp;|&nbsp; {ts}<br/>
+    Next scheduled report in approximately 1 hour
+  </div>
+
+</div>
 </div></body></html>"""
 
     text = (
-        f"QuantVault Hourly Report — {ts}\n"
+        f"QUANTVAULT HOURLY STRATEGY REPORT\n"
         f"{'='*50}\n"
-        f"STATUS: {overall}\n"
-        f"NAV: ${nav_usd:,.2f}  ({nav_change_str})\n"
-        f"Expected APR: {exp_apr:.1f}%  |  Uptime: {uptime_str}\n\n"
-        f"REGIME: {regime_name} ({regime_conf*100:.0f}% confident)\n"
-        f"  {REGIME_DESC.get(regime_name, '')}\n\n"
-        f"RISK: {cb_state} — {CB_DESC.get(cb_state, '')}\n"
-        f"Position sizing: {SCALE_DESC}\n\n"
-        f"FUNDING RATES:\n"
-        + "\n".join(f"  {sym}: {apr*100:.2f}% APR  (cascade risk: {cascade_risks.get(sym,0):.2f})" for sym, apr in sorted(funding_rates.items(), key=lambda x: -x[1]))
-        + f"\n\nALLOCATION:\n"
-        f"  Kamino Lending: {k_pct*100:.1f}%\n"
-        f"  Drift Spot Lending: {d_pct*100:.1f}%\n"
-        + "\n".join(f"  {sym} Perp: {pct*100:.1f}%" for sym, pct in perp_allocs.items())
-        + f"\n\nRebalances: {rebal_total}  |  Error rate: {error_rate:.1f}%\n"
+        f"Generated: {ts}  |  Uptime: {uptime_str}  |  Status: {overall_status}\n\n"
+        f"PORTFOLIO\n"
+        f"  NAV:          ${nav_usd:,.2f}  ({nav_dir}${abs(nav_change_usd):,.2f} / {nav_dir}{nav_change_pct:.2f}% vs prior)\n"
+        f"  Expected APR: {exp_apr:.1f}%\n"
+        f"  Rebalances:   {rebal_total}  (error rate: {error_rate:.1f}%)\n\n"
+        f"RISK\n"
+        f"  Circuit Breaker: {cb_state} — {CB_DESC.get(cb_state,'')}\n"
+        f"  Position Scale:  {pos_scale:.2f}x — {SCALE_DESC}\n"
+        f"  Drawdown Halt:   {'YES' if dd_halted else 'No'}\n\n"
+        f"REGIME\n"
+        f"  {regime_name} ({regime_conf*100:.0f}% confidence)\n"
+        f"  {REGIME_DESC.get(regime_name,'')}\n\n"
+        f"FUNDING RATES\n"
+        + "\n".join(f"  {sym}: {apr*100:.2f}% APR  |  cascade: {cascade_risks.get(sym,0):.2f}  |  {consec_positive.get(sym,0)}h consecutive positive" for sym, apr in sorted(funding_rates.items(), key=lambda x: -x[1]))
+        + f"\n\nALLOCATION\n"
+        f"  Kamino Lending:      {k_pct*100:.1f}%\n"
+        f"  Drift Spot Lending:  {d_pct*100:.1f}%\n"
+        + "\n".join(f"  {sym} Perp Short:    {pct*100:.1f}%" for sym, pct in perp_allocs.items())
+        + (f"\n\nAI COMMENTARY\n  {ai_commentary}" if ai_commentary else "")
+        + "\n"
     )
 
     return html, text, ts

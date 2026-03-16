@@ -911,7 +911,7 @@ async def send_report():
             req = _urlreq.Request(
                 "https://api.resend.com/emails",
                 data=payload,
-                headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json", "User-Agent": "QuantVault/1.0"},
                 method="POST",
             )
             try:

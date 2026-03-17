@@ -324,6 +324,26 @@ class DynamicAllocationOptimizer:
         # Standard carry: positive funding above threshold
         # Inverse carry: deeply negative funding, net yield = |apr| - borrow_cost > min
         best_lending_apr = max(kamino_apr, drift_spot_apr)
+
+        # Regime-adaptive entry threshold:
+        # In confirmed bull markets the funding cycle is rising — enter earlier
+        # to capture the full carry, not just the peak.
+        # In sideways markets be more selective — marginal carry barely beats lending.
+        effective_funding_threshold = self.config.target_funding_apr_threshold
+        if regime == MarketRegime.BULL_CARRY:
+            if regime_confidence >= 0.90:
+                # High conviction: lower bar to 65% — captures rising phase
+                effective_funding_threshold = max(5.0, effective_funding_threshold * 0.65)
+                logger.debug(
+                    "Regime-adaptive threshold: BULL_CARRY %.0f%% → threshold %.1f%%",
+                    regime_confidence * 100, effective_funding_threshold,
+                )
+            elif regime_confidence >= 0.70:
+                effective_funding_threshold = max(6.0, effective_funding_threshold * 0.80)
+        elif regime == MarketRegime.SIDEWAYS:
+            # Only enter on exceptional funding in choppy markets
+            effective_funding_threshold = effective_funding_threshold * 1.25
+
         eligible_markets = []
         for m in markets:
             if not m.is_perp:
@@ -331,7 +351,7 @@ class DynamicAllocationOptimizer:
             if m.cascade_risk >= self.config.cascade_risk_entry_gate:
                 continue
             # Standard carry (SHORT perp): positive funding
-            if (m.funding_apr >= self.config.target_funding_apr_threshold
+            if (m.funding_apr >= effective_funding_threshold
                     and m.persistence_score >= self.config.min_persistence_score
                     and m.consecutive_positive >= self.config.min_consecutive_positive
                     # Opportunity cost gate: perp must beat best lending by min_perp_edge_apr

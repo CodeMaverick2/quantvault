@@ -174,8 +174,10 @@ _funding_history_6h: dict[str, collections.deque] = {
 }
 _latest_regime: Optional[RegimePrediction] = None
 _latest_fast_regime: Optional[RegimePrediction] = None
-_kamino_apr: float = 5.0
-_drift_spot_apr: float = 7.0
+# Lending APRs — bot updates these via /lending-rates each cycle.
+# Env vars allow mainnet rates to be set on Railway without code changes.
+_kamino_apr: float = float(os.getenv("KAMINO_APR", "5.0"))
+_drift_spot_apr: float = float(os.getenv("DRIFT_SPOT_APR", "7.0"))
 
 HMM_BUFFER_SIZE = 48       # slow HMM: 48 hours
 HMM_FAST_BUFFER_SIZE = 6   # fast HMM: 6 hours (intraday shifts)

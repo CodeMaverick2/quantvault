@@ -26,6 +26,11 @@ import { startMetricsServer, vaultNavGauge } from "./metrics";
 const RISK_CHECK_INTERVAL_MS = 60_000;       // 1 minute
 const REBALANCE_INTERVAL_MS = 600_000;       // 10 minutes
 
+// Lending APRs: configurable via env so mainnet rates can be injected without code changes.
+// Devnet defaults (5/7%) are conservative; mainnet typical: Kamino 8-12%, Drift 6-10%.
+const KAMINO_APR   = parseFloat(process.env.KAMINO_APR   ?? "5.0");
+const DRIFT_APR    = parseFloat(process.env.DRIFT_SPOT_APR ?? "7.0");
+
 function loadKeypair(): Keypair {
   const key = process.env.KEEPER_PRIVATE_KEY;
   if (!key) throw new Error("KEEPER_PRIVATE_KEY not set in environment");
@@ -115,8 +120,19 @@ async function main() {
     logger.info("Strategy engine connected");
   }
 
+  // ── Push lending rates to strategy engine once at startup ─────────────────
+  if (engineReady) {
+    try {
+      await strategyClient.updateLendingRates(KAMINO_APR, DRIFT_APR);
+      logger.info(`Lending rates: Kamino=${KAMINO_APR}% Drift=${DRIFT_APR}%`);
+    } catch (err) {
+      logger.warn(`Failed to push lending rates: ${err}`);
+    }
+  }
+
   // ── Main loops ────────────────────────────────────────────────────────────
   let lastRebalanceTs = 0;
+  let lastPositionScale = 0;
   let isRunning = true;
 
   process.on("SIGINT", () => {
@@ -146,8 +162,15 @@ async function main() {
       continue;
     }
 
-    // ── Rebalance (every 10 minutes OR emergency trigger) ──────────────────
+    // ── Rebalance (every 10 minutes OR emergency trigger OR scale recovery) ──
     const needsRebalance = now - lastRebalanceTs >= REBALANCE_INTERVAL_MS;
+    // Scale recovery trigger: if CB scale jumped from below 0.3 to above 0.7 in one cycle,
+    // the cooldown just expired — rebalance immediately to deploy capital without waiting 10min
+    const scaleRecovered = lastPositionScale < 0.3 && riskStatus.positionScale > 0.7;
+    if (scaleRecovered) {
+      logger.info(`Scale recovered ${lastPositionScale.toFixed(2)}→${riskStatus.positionScale.toFixed(2)} — triggering early rebalance`);
+    }
+    lastPositionScale = riskStatus.positionScale;
 
     if (riskStatus.isEmergency) {
       logger.error(`Emergency detected: ${riskStatus.message}. Executing emergency exit.`);
@@ -157,7 +180,7 @@ async function main() {
       } catch (err) {
         logger.error(`Emergency exit failed: ${err}`);
       }
-    } else if (needsRebalance && engineReady) {
+    } else if ((needsRebalance || scaleRecovered) && engineReady) {
       logger.info("Starting scheduled rebalance cycle");
       try {
         await rebalancer.rebalance(false);
